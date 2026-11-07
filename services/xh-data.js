@@ -12,21 +12,120 @@ const { fetchPage, parseListing, parseVideoPage, SITE } = require("./xh-core");
 const { xhSuggest } = require("./xh-fetch");
 
 const LISTING_TTL_MS = 3 * 60 * 1000;   // listings change constantly
-const WATCH_TTL_MS = 15 * 60 * 1000;    // stream tokens live for hours
+// Stream tokens stay valid for hours (the `end=` epoch in the m3u8 URL), so a
+// 45-minute window means re-opening a video — by any number of users — costs
+// upstream nothing. Higher TTL here = fewer requests to their servers.
+const WATCH_TTL_MS = 45 * 60 * 1000;
+const STREAM_REPLAY_TTL_MS = 2 * 60 * 60 * 1000;  // < token lifetime (~4h)
 const SUGGEST_TTL_MS = 10 * 60 * 1000;
 const MAX_ENTRIES = 400;
 
-const cache = new Map();      // key -> { ts, value }
+const cache = new Map();      // key -> { ts, ttl, value }
 const inflight = new Map();   // key -> Promise
 
-const stats = { listingHits: 0, listingMisses: 0, watchHits: 0, watchMisses: 0, upstreamPages: 0 };
+/* Last-known-good copy of every page we have ever served. If upstream starts
+ * refusing us (403/429/block page) the site keeps rendering the previous render
+ * instead of turning into an error screen. This is the difference between "our
+ * scraper broke" and "our site broke". */
+const stale = new Map();      // key -> { ts, value }
+const STALE_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_STALE = 400;
 
-function remember(key, value, ttlMs) {
+/* The in-memory stale map dies with the process — which is exactly the moment
+ * you need it most (crash/restart while upstream is refusing us). So every page
+ * we serve is also snapshotted to disk and re-hydrated on boot: after a restart
+ * with every mirror unreachable, the site still renders what it last knew.
+ */
+const CACHE_DIR = path.join(__dirname, "..", ".cache");
+const PAGE_CACHE_FILE = path.join(CACHE_DIR, "page-cache.json");
+const DISK_MAX_ENTRIES = 120;
+const DISK_MAX_BYTES = 8 * 1024 * 1024;
+const FLUSH_DEBOUNCE_MS = 2500;
+
+const stats = { listingHits: 0, listingMisses: 0, watchHits: 0, watchMisses: 0, upstreamPages: 0, staleServes: 0 };
+
+function remember(key, value, ttlMs, staleTtlMs) {
   if (cache.size >= MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
   cache.set(key, { ts: Date.now(), ttl: ttlMs, value });
+  if (stale.size >= MAX_STALE) {
+    const oldest = stale.keys().next().value;
+    if (oldest !== undefined) stale.delete(oldest);
+  }
+  stale.delete(key);
+  stale.set(key, { ts: Date.now(), value, staleTtl: staleTtlMs || STALE_TTL_MS });
+  scheduleFlush();
+}
+
+function entryStaleTtl(entry) {
+  return (entry && entry.staleTtl) || STALE_TTL_MS;
+}
+
+function recallStale(key) {
+  const hit = stale.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > entryStaleTtl(hit)) { stale.delete(key); return null; }
+  return hit.value;
+}
+
+/* ---------- durable snapshot (survives restart while upstream is blocked) ---------- */
+let flushTimer = null;
+let flushing = false;
+
+function hydrateFromDisk() {
+  try {
+    if (!fs.existsSync(PAGE_CACHE_FILE)) return;
+    const raw = fs.readFileSync(PAGE_CACHE_FILE, "utf8");
+    if (!raw || raw.length > DISK_MAX_BYTES) return;
+    const obj = JSON.parse(raw);
+    const now = Date.now();
+    let loaded = 0;
+    for (const key of Object.keys(obj || {})) {
+      const entry = obj[key];
+      if (!entry || !entry.value || !entry.ts) continue;
+      const ttl = (entry.staleTtl || STALE_TTL_MS);
+      if (now - entry.ts > ttl) continue;
+      stale.set(key, { ts: entry.ts, value: entry.value, staleTtl: ttl });
+      loaded++;
+    }
+    if (loaded) console.log("[data] hydrated " + loaded + " cached pages from disk");
+  } catch (e) {
+    console.warn("[data] page cache read failed:", e.message);
+  }
+}
+
+function scheduleFlush() {
+  if (flushTimer) return;
+  flushTimer = setTimeout(flushToDisk, FLUSH_DEBOUNCE_MS);
+  if (flushTimer.unref) flushTimer.unref();
+}
+
+function flushToDisk() {
+  flushTimer = null;
+  if (flushing) { scheduleFlush(); return; }
+  flushing = true;
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    const now = Date.now();
+    const keys = [...stale.keys()].slice(-DISK_MAX_ENTRIES);
+    const out = {};
+    for (const key of keys) {
+      const entry = stale.get(key);
+      if (!entry || now - entry.ts > entryStaleTtl(entry)) continue;
+      out[key] = entry;
+    }
+    const json = JSON.stringify(out);
+    if (json.length > DISK_MAX_BYTES) return;
+    const tmp = PAGE_CACHE_FILE + ".tmp";
+    fs.writeFileSync(tmp, json);
+    fs.renameSync(tmp, PAGE_CACHE_FILE);   // atomic: never a half-written cache
+  } catch (e) {
+    console.warn("[data] page cache write failed:", e.message);
+  } finally {
+    flushing = false;
+  }
 }
 
 function recall(key) {
@@ -149,16 +248,24 @@ async function listing({ url, key, page, priority }) {
   return singleFlight(cacheKey, async () => {
     stats.listingMisses++;
     stats.upstreamPages++;
-    const html = await fetchPage(url, { priority: priority === 0 ? 0 : 1 });
-    const parsed = parseListing(html);
-    const value = {
-      videos: parsed.cards,
-      page,
-      lastPage: Math.max(parsed.lastPage, page),
-      total: parsed.total,
-    };
-    if (value.videos.length) remember(cacheKey, value, LISTING_TTL_MS);
-    return { ...value, cached: false };
+    try {
+      const html = await fetchPage(url, { priority: priority === 0 ? 0 : 1 });
+      const parsed = parseListing(html);
+      const value = {
+        videos: parsed.cards,
+        page,
+        lastPage: Math.max(parsed.lastPage, page),
+        total: parsed.total,
+      };
+      if (value.videos.length) remember(cacheKey, value, LISTING_TTL_MS);
+      return { ...value, cached: false };
+    } catch (e) {
+      const prev = recallStale(cacheKey);
+      if (!prev) throw e;
+      stats.staleServes++;
+      console.warn("[data] upstream failed for", cacheKey, "— serving stale:", e.message);
+      return { ...prev, cached: true, stale: true };
+    }
   });
 }
 
@@ -203,7 +310,16 @@ async function watch({ slug }) {
   return singleFlight(cacheKey, async () => {
     stats.watchMisses++;
     stats.upstreamPages++;
-    const html = await fetchPage(SITE + "/videos/" + clean, { priority: 0 });
+    let html;
+    try {
+      html = await fetchPage(SITE + "/videos/" + clean, { priority: 0 });
+    } catch (e) {
+      const prev = recallStale(cacheKey);
+      if (!prev) throw e;
+      stats.staleServes++;
+      console.warn("[data] upstream failed for", cacheKey, "— serving stale:", e.message);
+      return { ...prev, cached: true, stale: true };
+    }
     const parsed = parseVideoPage(html);
     // A page that parsed to nothing is a missing/removed video, not a stream we
     // can show — answer 404 so the client can say so plainly.
@@ -218,9 +334,13 @@ async function watch({ slug }) {
       related: parsed.related.slice(0, 24),
       unsupported: parsed.unsupported,
     };
-    // Cache only real results; a video's stream token stays valid for hours so
-    // re-opening it (or the browser retrying) is instant.
-    if (value.stream || value.unsupported) remember(cacheKey, value, WATCH_TTL_MS);
+    // Cache only real results. The stream URL is a signed token that outlives a
+    // few hours but not six, so a watch entry may only be replayed while its
+    // signature is still valid — otherwise a blocked upstream would serve a dead
+    // player instead of an honest error.
+    if (value.stream || value.unsupported) {
+      remember(cacheKey, value, WATCH_TTL_MS, STREAM_REPLAY_TTL_MS);
+    }
     return { ...value, cached: false };
   });
 }
@@ -242,6 +362,8 @@ async function suggest(q) {
   return items;
 }
 
+hydrateFromDisk();
+
 module.exports = {
   FEEDS,
   PERIODS,
@@ -253,4 +375,7 @@ module.exports = {
   categoryTree,
   categoryInfo,
   stats,
+  staleSize: () => stale.size,
+  flushToDisk,
+  STALE_TTL_MS,
 };

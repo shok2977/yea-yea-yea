@@ -1,0 +1,8 @@
+TubeStream listening on http://localhost:3006
+[Categories] 582 in 11 groups
+[Mode] on-demand only — no prefetch, no warm queue
+[xhFetch] DoH xhamster99.com -> 172.67.135.254, 104.21.78.165
+[xhFetch] host down xhamster99.com - xh timeout 7000ms cooldown 12s
+[xh] direct attempt 1 failed: xh timeout 7000ms https://xhamster.com/newest
+[API] upstream blocked (relay disabled)
+[HTTP] GET /api/feed?tab=newest 502 7371ms

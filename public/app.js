@@ -47,6 +47,17 @@
   function thumbUrl(u) {
     return u ? "/api/thumb?url=" + encodeURIComponent(u) : "";
   }
+
+  /* Thumbnails sit on the same CDN zone as the video and need no CORS — an <img>
+   * renders a cross-origin picture even though scripting cannot read it. So the
+   * grid loads them straight from the source too. The first failure switches the
+   * rest of the session back to /api/thumb. */
+  let thumbDirectOff = false;
+
+  function thumbSrc(u) {
+    if (!u) return "";
+    return thumbDirectOff ? thumbUrl(u) : u;
+  }
   function fmtViews(n) {
     if (!n && n !== 0) return "";
     if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B views";
@@ -183,7 +194,8 @@
       '<a class="card" href="' + href + '" data-link>' +
         '<div class="thumb">' +
           (v.thumb
-            ? '<img loading="lazy" decoding="async" alt="" src="' + thumbUrl(v.thumb) + '">'
+            ? '<img loading="lazy" decoding="async" alt="" referrerpolicy="no-referrer" src="' + esc(thumbSrc(v.thumb)) + '"' +
+              (thumbDirectOff ? "" : ' data-fb="' + esc(thumbUrl(v.thumb)) + '"') + ">"
             : '<div class="thumb-fallback">▶</div>') +
           '<div class="play-pip"><span>▶</span></div>' +
           (v.duration ? '<span class="badge dur">' + esc(v.duration) + "</span>" : "") +
@@ -200,7 +212,17 @@
       const done = () => img.classList.add("loaded");
       if (img.complete && img.naturalWidth) done();
       else img.addEventListener("load", done, { once: true });
-      img.addEventListener("error", () => {
+      img.addEventListener("error", function onErr() {
+        // Direct CDN unreachable here — retry this one through the proxy and stop
+        // trying direct for the rest of the session.
+        const fb = img.getAttribute("data-fb");
+        if (fb) {
+          thumbDirectOff = true;
+          img.removeAttribute("data-fb");
+          img.src = fb;
+          return;
+        }
+        img.removeEventListener("error", onErr);
         img.style.display = "none";
         const wrap = img.parentElement;
         if (wrap && !wrap.querySelector(".thumb-fallback")) {
@@ -209,7 +231,7 @@
           ph.textContent = "▶";
           wrap.appendChild(ph);
         }
-      }, { once: true });
+      });
     });
   }
 
@@ -463,8 +485,14 @@
     }
 
     if (v.thumb) {
-      const poster = thumbUrl(v.thumb);
-      $("player").poster = poster;
+      const el = $("player");
+      const poster = thumbSrc(v.thumb);
+      el.poster = poster;
+      // <video poster> never reports a load failure, so probe it once and fall
+      // back to the proxy when the CDN picture does not arrive.
+      const probe = new Image();
+      probe.onerror = () => { if (el) el.poster = thumbUrl(v.thumb); };
+      probe.src = poster;
     }
 
     try {
@@ -500,27 +528,96 @@
     }
   }
 
-  function srcFor(url) {
+  function proxied(url) {
     return "/api/stream?url=" + encodeURIComponent(url);
+  }
+
+  /* ---------------------------- direct playback ----------------------------
+   * The playlists and segments live on *.xhmediacdn.com, which is a *different*
+   * host from the one the ISP poisons, and it answers every request with
+   * `Access-Control-Allow-Origin: *`. So the browser can pull the video itself —
+   * exactly the requests a normal viewer on the source site makes.
+   *
+   * That keeps the bytes on the viewer's own connection instead of funnelling
+   * every user's 30–40 minute watch through this one server, and the CDN sees an
+   * ordinary viewer address rather than a single machine moving gigabytes 24/7.
+   * /api/stream stays as the fallback for connections where that host is blocked
+   * or the signed URL refuses a different address.
+   */
+  const directBlocked = new Set();   // hosts that already failed here, this session
+
+  function hostOf(url) {
+    try { return new URL(url).host; } catch (e) { return ""; }
+  }
+
+  function sourceOrder(url) {
+    const host = hostOf(url);
+    // Once a host has failed in this tab, stop paying the failed attempt per video.
+    if (host && directBlocked.has(host)) return [proxied(url)];
+    return host ? [url, proxied(url)] : [proxied(url)];
+  }
+
+  function noteSourceFail(src) {
+    const host = hostOf(src);
+    if (host) directBlocked.add(host);
   }
 
   async function playStream(video, url, signal) {
     destroyHls();
-    const src = srcFor(url);
+    const sources = sourceOrder(url);
+    let lastErr = null;
 
-    // Native HLS (Safari/iOS) needs no library at all.
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src;
-      video.play().catch(() => {});
-      return;
+    for (let i = 0; i < sources.length; i++) {
+      const src = sources[i];
+      if (signal && signal.aborted) return;
+      try {
+        if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          await attachNative(video, src, signal);
+        } else {
+          await attachHls(video, src, signal);
+        }
+        return;
+      } catch (e) {
+        lastErr = e;
+        destroyHls();
+        noteSourceFail(src);
+        try { video.removeAttribute("src"); video.load(); } catch (err) { /* ignore */ }
+      }
     }
+    throw lastErr || new Error("stream unavailable");
+  }
 
+  // Native HLS (Safari/iOS) needs no library at all.
+  function attachNative(video, src, signal) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        video.removeEventListener("loadedmetadata", ok);
+        video.removeEventListener("error", bad);
+        fn(arg);
+      };
+      const ok = () => done(resolve);
+      const bad = () => done(reject, new Error("native playback failed"));
+      const timer = setTimeout(() => {
+        if (video.readyState >= 1) done(resolve);
+        else done(reject, new Error("native playback timeout"));
+      }, 12000);
+      video.addEventListener("loadedmetadata", ok);
+      video.addEventListener("error", bad);
+      video.src = src;
+      video.play().catch(() => { /* autoplay policy — controls are visible */ });
+    });
+  }
+
+  async function attachHls(video, src, signal) {
     const Hls = await loadHlsJs();
     if (signal && signal.aborted) return;
-
     if (!Hls.isSupported()) throw new Error("HLS is not supported in this browser");
 
-    hlsInstance = new Hls({
+    const hls = new Hls({
       enableWorker: true,
       lowLatencyMode: false,
       startFragPrefetch: false,      // play exactly what the player asks for
@@ -530,43 +627,68 @@
       maxBufferLength: 24,
       backBufferLength: 30,
     });
-    hlsInstance.loadSource(src);
-    hlsInstance.attachMedia(video);
+    hlsInstance = hls;
 
     // The sources go up to 2160p; climbing there costs bandwidth with no visible
     // gain. Cap the ladder at 720p (levels[] is reliably populated by the time a
     // level playlist has loaded).
     const capLevels = () => {
       try {
-        const levels = hlsInstance.levels || [];
+        const levels = hls.levels || [];
         let cap = -1;
         levels.forEach((l, i) => {
           if (l.height && l.height <= 720 && (cap < 0 || l.height > levels[cap].height)) cap = i;
         });
-        if (cap >= 0) hlsInstance.autoLevelCapping = cap;
+        if (cap >= 0) hls.autoLevelCapping = cap;
       } catch (err) { /* best-effort */ }
     };
 
-    let recovered = false;
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-      capLevels();
-      video.play().catch(() => { /* autoplay policy — controls are visible */ });
-    });
-    hlsInstance.on(Hls.Events.LEVEL_LOADED, capLevels);
-    hlsInstance.on(Hls.Events.ERROR, (_evt, info) => {
-      if (!info || !info.fatal) return;
-      if (!recovered && (info.type === Hls.ErrorTypes.NETWORK_ERROR || info.type === Hls.ErrorTypes.MEDIA_ERROR)) {
-        recovered = true;
-        if (info.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
-        else hlsInstance.recoverMediaError();
-        return;
-      }
-      const msg = $("playerMsg");
-      const txt = $("playerMsgText");
-      if (msg && txt) {
-        msg.classList.remove("hidden");
-        txt.textContent = "Playback failed — this video may be unavailable.";
-      }
+    return new Promise((resolve, reject) => {
+      let started = false;
+      let recovered = false;
+      const timer = setTimeout(() => {
+        if (started) return;
+        started = true;
+        reject(new Error("stream start timeout"));
+      }, 12000);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (started) return;
+        started = true;
+        clearTimeout(timer);
+        capLevels();
+        video.play().catch(() => { /* autoplay policy — controls are visible */ });
+        resolve();
+      });
+      hls.on(Hls.Events.LEVEL_LOADED, capLevels);
+      hls.on(Hls.Events.ERROR, (_evt, info) => {
+        if (!info || !info.fatal) return;
+
+        // Nothing played yet: this source is unreachable from here — let the
+        // caller try the next one (direct → proxy).
+        if (!started) {
+          started = true;
+          clearTimeout(timer);
+          reject(new Error("source unreachable"));
+          return;
+        }
+
+        if (!recovered && (info.type === Hls.ErrorTypes.NETWORK_ERROR || info.type === Hls.ErrorTypes.MEDIA_ERROR)) {
+          recovered = true;
+          if (info.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+          else hls.recoverMediaError();
+          return;
+        }
+        const msg = $("playerMsg");
+        const txt = $("playerMsgText");
+        if (msg && txt) {
+          msg.classList.remove("hidden");
+          txt.textContent = "Playback failed — this video may be unavailable.";
+        }
+      });
+
+      hls.loadSource(src);
+      hls.attachMedia(video);
     });
   }
 

@@ -1,57 +1,17 @@
 TubeStream listening on http://localhost:3001
 [Categories] 582 in 11 groups
 [Mode] on-demand only — no prefetch, no warm queue
-[xhFetch] DoH IPs: 104.16.4.81, 104.16.3.81
-[xh] direct attempt 1 failed: xh direct http 404 https://xhamster.com/videos/this-video-does-not-exist-xyz123
-[xh] direct attempt 2 failed: xh direct http 404 https://xhamster.com/videos/this-video-does-not-exist-xyz123
-[xh] served via mirror in 5646ms https://xhamster.com/videos/this-video-does-not-exist-xyz123
-[HTTP] GET /api/watch/this-video-does-not-exist-xyz123 404 5738ms
-[HTTP] GET /api/watch/kitchen-me-piche-se-ghus-ke-bhabhi-ko-chod-diya-xhY8JS8 200 1230ms
-[HTTP] GET /api/feed?tab=hot&page=1 200 1391ms
-[HTTP] GET /api/feed?tab=newest&page=1 200 1389ms
-[xh] direct slow 2166ms https://xhamster.com/best/weekly
-[HTTP] GET /api/feed?tab=popular&page=1 200 2176ms
-[HTTP] GET /api/category/desi?page=1 200 1282ms
-[HTTP] GET /api/search?q=desi&page=1 200 1300ms
-[HTTP] GET /api/watch/full-hard-core-compilation-latika-big-cock-enjoy-xh1dZ8d 200 1199ms
-[HTTP] GET /api/feed?tab=top&page=1 200 1111ms
-[HTTP] GET /api/watch/indian-asian-desi-old-man-with-her-young-wife-old-young-wife-hardcore-licking-fucking-newly-married-morning-sex-video-xh2ZQ1Y 200 1157ms
-[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FMTc4OWMxY2NiMmQ1MzgyYWNkZDA0M2I4MTdiZTU5NmM%2Fs(w%3A1280%2Ch%3A720)%2Cwebp%2F031%2F243%2F362%2Fv2%2F2560x1440.213.webp 200 483ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F1080p.av1.mp4%2Fseg-4-v1-a1.m4s 200 578ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F2160p.av1.mp4%2Fseg-5-v1-a1.m4s 200 1144ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F2160p.av1.mp4%2Fseg-6-v1-a1.m4s 200 2311ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F2160p.av1.mp4%2Fseg-7-v1-a1.m4s 200 2836ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F2160p.av1.mp4%2Fseg-8-v1-a1.m4s 200 2609ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F2160p.av1.mp4%2Fseg-9-v1-a1.m4s 200 1569ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss-a.xhmediacdn.com%2FB7SfgHxJ2iu6ILls6b5wLQ%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p%3A%2C1920x1080%3A1080p%3A%2C3840x2160%3A2160p%3A%2F031%2F243%2F362%2F2160p.av1.mp4%2Fseg-10-v1-a1.m4s 200 939ms
-[HTTP] GET /api/category/tattoo?page=1 200 1284ms
-[HTTP] GET /api/watch/kamine-pati-ne-wife-ke-samne-bhabhi-ko-choda-xhcQb59 200 1000ms
-[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FZWNiYzhiNDNjN2JhOTIxZWFlNDY3ZjFkOGQyNWNhYjc%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F031%2F447%2F602%2F1280x720.17939867.jpg 200 442ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-11-v1-a1.m4s 200 653ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-28-v1-a1.m4s 200 466ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-29-v1-a1.m4s 200 577ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-30-v1-a1.m4s 200 759ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-31-v1-a1.m4s 200 452ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-32-v1-a1.m4s 200 446ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-34-v1-a1.m4s 200 406ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-37-v1-a1.m4s 200 470ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F1080p.7700b.av1.mp4%2Fseg-44-v1-a1.m4s 200 576ms
-[HTTP] GET /api/feed?tab=hot&page=1 200 971ms
-[HTTP] GET /api/feed?tab=newest&page=1 200 1037ms
-[HTTP] GET /api/feed?tab=popular&page=1 200 1056ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F720p.7700b.av1.mp4%2Fseg-184-v1-a1.m4s 200 502ms
-[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-am-b.xhmediacdn.com%2FAhCPi3TSzVzR8jxawWPvzw%3D%3D%2C1793962800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%3A%2C426x240%3A240p%3A%2C854x480%3A480p%3A%2C1280x720%3A720p.7700b%3A%2C1920x1080%3A1080p.7700b%3A%2F031%2F454%2F686%2F720p.7700b.av1.mp4%2Fseg-191-v1-a1.m4s 200 462ms
-[xhFetch] DoH IPs: 104.16.4.81, 104.16.3.81
-[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FMjgzMWIyZDdlZjAwOWRkMmRjNmY2ZDIzZmUxYjQ4NTc%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F031%2F520%2F463%2Fv2%2F526x298.211.webp 200 3054ms
-[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FODQ1MDQwODU2Mjg3YTA3MmVkYmE1NzgwYjU4NzRiODY%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F031%2F489%2F483%2Fv2%2F526x298.208.webp 200 1316ms
-[xh] direct slow 2699ms m/videos/i-shared-bed-with-my-wife-and-sister-in-law-xhh3uBP
-[HTTP] GET /api/watch/i-shared-bed-with-my-wife-and-sister-in-law-xhh3uBP 200 3567ms
-[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FMmQ5YmY0NzRjM2JhYWM5YTA5ZjhhNDJjNWQzOWYzY2M%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F030%2F041%2F382%2F1280x720.17828013.jpg 200 406ms
-[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FMWYzZmVkMDI5MGI1MmZiM2QzN2I3Yjc3MTAwMjY2MDE%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F027%2F956%2F852%2F1280x720.17628848.jpg 200 413ms
-[HTTP] GET /api/feed?tab=popular&page=1 200 982ms
-[HTTP] GET /api/feed?tab=hot&page=1 200 1140ms
-[HTTP] GET /api/feed?tab=newest&page=1 200 1323ms
-[HTTP] GET /api/search?q=mia&page=1 200 1304ms
-[HTTP] GET /api/suggest?q=leggins 200 436ms
-[HTTP] GET /api/search?q=leggins&page=1 200 1469ms
-[HTTP] GET /api/watch/massage-pussy-and-big-squirting-orgasm-in-leggings-xh3n0Mw 200 1382ms
+[xhFetch] DoH xhamster.com -> 104.16.4.81, 104.16.3.81
+[HTTP] GET /api/feed?tab=newest 200 1294ms
+[HTTP] GET /api/watch/sexy-valery-webcam-xhfkK3r 200 786ms
+[xhFetch] DoH xhamster.com -> 104.16.3.81, 104.16.4.81
+[HTTP] GET /api/feed?tab=newest 200 1088ms
+[HTTP] GET /api/watch/don-t-resist-to-my-webcam-curves-xhmPHz0 200 1031ms
+[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FZjhhM2YwMWFjODRkYWM1M2JlNjQxMzNmMjc3Y2YxNzM%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F025%2F383%2F650%2Fv2%2F526x298.296.webp 200 440ms
+[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FNzFhOTQwZDQwYTNiZjQyNmMwMDY2ZTkxZDU0YjUyNmU%2Fs(w%3A526%2Ch%3A298)%2Cwebp%2F024%2F877%2F076%2F1280x720.17202209.jpg 200 439ms
+[HTTP] GET /api/thumb?url=https%3A%2F%2Fic-vt-nss.xhmediacdn.com%2Fa%2FY2Q3NWUxYWRkNTM2NmQ3Mjk0MTY4MmNkNDU0MjhjZmU%2Fs(w%3A1280%2Ch%3A720)%2Cwebp%2F031%2F489%2F696%2Fv2%2F2560x1440.201.webp 200 570ms
+[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss.xhmediacdn.com%2Fapi%2Fstream%3Furl%3Dhttps%253A%252F%252Fvideo-nss.xhmediacdn.com%252FNk4DUU1FOYH_30ptcNUOGQ%253D%253D%252C1794052800%252Fmedia%253Dhls4%252Fmulti%253D256x144%253A144p%252C426x240%253A240p%252F031%252F489%252F696%252F144p.h264.mp4.m3u8 502 276ms
+[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss.xhmediacdn.com%2Fapi%2F%257B%2522error%2522%3A%2522playlist%2520http%2520403%2522%257D 502 78ms
+[HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss.xhmediacdn.com%2FNk4DUU1FOYH_30ptcNUOGQ%3D%3D%2C1794052800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%2C426x240%3A240p%2F031%2F489%2F696%2F144p.h264.mp4.m3u8 200 403ms
+[xhFetch] DoH xhamster.com -> 104.16.3.81, 104.16.4.81
+[HTTP] GET /api/feed?tab=newest&page=1 200 1142ms

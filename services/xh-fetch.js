@@ -1,33 +1,70 @@
-/* xh-fetch.js — direct xHamster fetch via DoH-resolved Cloudflare IPs.
+/* xh-fetch.js — direct xHamster fetch over a DoH-pinned mirror pool.
  *
- * In this environment the ISP (Jio) hijacks DNS for xhamster.com (→ 49.44.79.236
- * block page), but TLS/SNI routing to the real Cloudflare IPs still works. We
- * resolve real IPs over DoH (1.1.1.1, then 8.8.8.8 — both literal IPs, so no
- * DNS needed for the resolver itself) and pin them inside an https.Agent via a
- * custom `lookup`. SNI stays xhamster.com, connection goes to the real edge.
+ * Two problems solved here:
  *
- * Measured on this machine: 0.9–1.5s per page vs 3–9s+ via r.jina.ai relay.
- * Full evidence: xhamster-hidden-api-report.md §2–§3.
+ * 1) DNS. In this environment the ISP (Jio) hijacks DNS for xhamster.com
+ *    (→ 49.44.79.236 block page), but TLS/SNI routing to the real Cloudflare IPs
+ *    still works. We resolve real IPs over DoH (1.1.1.1, then 8.8.8.8 — both
+ *    literal IPs, so no DNS needed for the resolver itself) and pin them inside
+ *    an https.Agent via a custom `lookup`. SNI stays the real hostname, the
+ *    connection goes to the real edge. Measured 0.9–1.5 s per page vs 3–9 s+
+ *    through a text relay.
  *
- * Cloudflare rate-limit discipline (report §3/§6a): bursts of rapid hits can
- * trigger a ~2min cooldown. Background jobs are globally paced; user-facing
- * clicks (priority 0) are never delayed. Retries rotate to the other IP.
+ * 2) A single hostname is a single point of failure. xHamster runs its own
+ *    anti-block domain fleet — the numbered .com/.desi mirrors they rotate
+ *    whenever a country blocks a domain (Germany blocked de.xhamster.com, they
+ *    opened deu.xhamster.com). Every host in that fleet serves the identical
+ *    SSR payload (`window.initials`), so a host swap needs zero parser changes.
+ *    We treat that fleet as our redundancy: sticky last-good host, per-host
+ *    health, exponential-ish cooldown, and failover on 403/429/5xx/timeout.
+ *
+ * Honest scope: this raises resilience a lot, it does NOT make blocking
+ * impossible. Their WAF still sees one ASN, one TLS fingerprint and one request
+ * rhythm; rate limiting there is per IPv4 address or per IPv6 /64, so swapping
+ * mirror hostnames does not buy fresh limit buckets by itself.
  */
 const https = require("https");
+const dns = require("dns");
 const crypto = require("crypto");
+const zlib = require("zlib");
+const fs = require("fs");
+const path = require("path");
 
 const XH_HOST = "xhamster.com";
-const XH_HOST_RE = /(^|\.)xhamster\.com$/;
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
+/* xHamster's own domain fleet. Ordered: canonical first, then the mirrors their
+ * own users get redirected to when a region blocks the main domain. */
+/* Any hostname in the family is allowed for DoH pinning and redirect-following. */
+const HOST_RE = /(^|\.)(xhamster\d*\.(?:com|desi|one|net|best)|xhopen\.com|xhspot\.com|xhtotal\.com|xhaccess\.com|xhday\.com|xhvid\.com|xhms\.pro)$/i;
+
+function isPoolHost(h) {
+  return HOST_RE.test(String(h || ""));
+}
+
+/* HOST_POOL is overridable so an operator can pin a working mirror without a
+ * code change (e.g. XH_HOSTS=xhamster.desi,xhopen.com). */
+const HOST_POOL = (process.env.XH_HOSTS || "")
+  .split(",")
+  .map((h) => h.trim())
+  .filter(isPoolHost);
+if (!HOST_POOL.length) {
+  // Order is evidence-based: the first three answered with the identical
+  // `window.initials` payload from here; the rest are network-dependent
+  // fallbacks kept last so a dead one never costs a timeout before a live one.
+  HOST_POOL.push("xhamster.com", "xhamster.desi", "xhamster3.com", "xhamster2.com", "xhopen.com", "xhspot.com");
+}
+
+/* ------------------------------ DoH resolver ------------------------------ */
 const DOH_ENDPOINTS = [
-  "https://1.1.1.1/dns-query?name=" + XH_HOST + "&type=A",   // Cloudflare dns-json
-  "https://8.8.8.8/resolve?name=" + XH_HOST + "&type=A",     // Google DNS JSON fallback
+  "https://1.1.1.1/dns-query?name=<host>&type=A",   // Cloudflare dns-json
+  "https://8.8.8.8/resolve?name=<host>&type=A",     // Google DNS JSON fallback
 ];
-const IP_TTL = 5 * 60 * 1000;
+const DNS_TTL = 5 * 60 * 1000;
 
-let ipCache = { ips: [], ts: 0, idx: 0 };
-let resolving = null;
+const dnsState = new Map();   // host -> { ips, ts, idx }
+const resolving = new Map();  // host -> Promise
 
 function dohQuery(endpoint) {
   return new Promise((resolve, reject) => {
@@ -52,43 +89,304 @@ function dohQuery(endpoint) {
   });
 }
 
-async function resolveIps(force) {
-  if (!force && ipCache.ips.length && Date.now() - ipCache.ts < IP_TTL) return ipCache.ips;
-  if (resolving) return resolving;
-  resolving = (async () => {
+async function resolveHost(host, force) {
+  const cached = dnsState.get(host);
+  if (!force && cached && cached.ips.length && Date.now() - cached.ts < DNS_TTL) return cached.ips;
+  if (resolving.has(host)) return resolving.get(host);
+
+  const job = (async () => {
     let lastErr;
-    for (const ep of DOH_ENDPOINTS) {
+    for (const tpl of DOH_ENDPOINTS) {
       try {
-        const ips = await dohQuery(ep);
-        if (force) ipCache.idx++;               // rotate away from a failing edge
-        ipCache = { ips, ts: Date.now(), idx: ipCache.idx };
-        console.log("[xhFetch] DoH IPs:", ips.join(", "));
+        const ips = await dohQuery(tpl.replace("<host>", encodeURIComponent(host)));
+        const prev = dnsState.get(host);
+        dnsState.set(host, { ips, ts: Date.now(), idx: (prev ? prev.idx + (force ? 1 : 0) : 0) });
+        console.log("[xhFetch] DoH", host, "->", ips.join(", "));
         return ips;
       } catch (e) { lastErr = e; }
     }
-    throw lastErr || new Error("doh failed");
-  })().finally(() => { resolving = null; });
-  return resolving;
+    throw lastErr || new Error("doh failed for " + host);
+  })().finally(() => resolving.delete(host));
+
+  resolving.set(host, job);
+  return job;
 }
 
-function prewarmIps() { resolveIps(false).catch(() => {}); }
-prewarmIps();
-
-/* Pinned lookup for the xhamster agent. Node 20+ also calls with
- * opts.all:true and expects [{address, family}] — both shapes handled
- * (the all:true miss caused "Invalid IP address: undefined" in testing). */
-function pinnedLookup(opts, cb) {
-  resolveIps(false).then((ips) => {
-    const ip = ips[ipCache.idx % ips.length];
-    if (opts && opts.all) cb(null, [{ address: ip, family: 4 }]);
-    else cb(null, ip, 4);
-  }).catch(cb);
+/* Node 20+ also calls lookup with opts.all:true and expects [{address, family}]. */
+function pinnedLookup(hostname, opts, cb) {
+  if (!isPoolHost(hostname)) return dns.lookup(hostname, opts, cb);
+  resolveHost(hostname, false)
+    .then((ips) => {
+      const st = dnsState.get(hostname);
+      const ip = ips[((st && st.idx) || 0) % ips.length];
+      if (opts && opts.all) return cb(null, [{ address: ip, family: 4 }]);
+      cb(null, ip, 4);
+    })
+    .catch(() => dns.lookup(hostname, opts, cb));
 }
 
-const xhAgent = new https.Agent({ keepAlive: true, maxSockets: 10, lookup: (host, opts, cb) => pinnedLookup(opts, cb) });
+const xhAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 12,
+  maxFreeSockets: 6,
+  keepAliveMsecs: 60 * 1000,
+  lookup: pinnedLookup,
+});
+
+/* ------------------------- upstream governor ------------------------------
+ * The whole point of this app being invisible is that N users must never become
+ * N upstream requests. Upstream sees at most MAX_INFLIGHT sockets and at most
+ * RATE_PER_SEC page fetches — the same shape one person browsing produces, no
+ * matter whether ten people or ten thousand are on the site. User clicks jump
+ * the queue ahead of background work, but they are still rate-capped: a traffic
+ * spike must never turn into a burst on their side.
+ */
+const MAX_INFLIGHT = 4;
+const RATE_PER_SEC = 6;
+const RATE_BURST = 6;
+
+let tokens = RATE_BURST;
+let lastRefill = Date.now();
+let inflightCount = 0;
+const waiters = [];
+let pumpTimer = null;
+
+function refillTokens() {
+  const now = Date.now();
+  const add = ((now - lastRefill) / 1000) * RATE_PER_SEC;
+  if (add > 0) {
+    tokens = Math.min(RATE_BURST, tokens + add);
+    lastRefill = now;
+  }
+}
+
+function pumpQueue() {
+  refillTokens();
+  while (waiters.length && inflightCount < MAX_INFLIGHT && tokens >= 1) {
+    const job = waiters.shift();
+    if (Date.now() > job.deadline) { job.drop(new Error("upstream queue timeout")); continue; }
+    tokens -= 1;
+    inflightCount += 1;
+    let released = false;
+    job.grant(() => {
+      if (released) return;
+      released = true;
+      inflightCount -= 1;
+      pumpQueue();
+    });
+  }
+  if (waiters.length && !pumpTimer) {
+    pumpTimer = setTimeout(() => { pumpTimer = null; pumpQueue(); }, 40);
+  }
+}
+
+function acquireSlot(priority, deadline) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const job = {
+      priority,
+      deadline,
+      grant: (release) => { if (timer) clearTimeout(timer); resolve(release); },
+      drop: (err) => { if (timer) clearTimeout(timer); reject(err); },
+    };
+
+    // A request that waits this long is not worth serving anyway.
+    timer = setTimeout(() => {
+      const i = waiters.indexOf(job);
+      if (i !== -1) { waiters.splice(i, 1); job.drop(new Error("upstream queue timeout")); }
+    }, Math.max(0, deadline - Date.now()));
+
+    if (priority === 0) {
+      // User is waiting: go in front of every background job.
+      const i = waiters.findIndex((w) => w.priority > 0);
+      if (i === -1) waiters.push(job); else waiters.splice(i, 0, job);
+    } else {
+      waiters.push(job);
+    }
+    pumpQueue();
+  });
+}
+
+/* ------------------------------ cookie jar ---------------------------------
+ * A scraper that opens every request with no cookies is a scraper. Holding the
+ * session cookies xHamster hands out (age gate, consent, session) makes repeat
+ * fetches look like one browser coming back, which is both more honest to their
+ * CDN and cheaper: the warmed session skips the interstitial.
+ */
+const COOKIE_MAX = 40;
+const cookies = new Map();
+
+function cookieHeader() {
+  if (!cookies.size) return "";
+  const parts = [];
+  for (const [k, v] of cookies) parts.push(k + "=" + v);
+  return parts.join("; ");
+}
+
+function storeCookies(setCookie) {
+  const list = Array.isArray(setCookie) ? setCookie : (setCookie ? [setCookie] : []);
+  for (const line of list) {
+    const first = String(line).split(";")[0];
+    const eq = first.indexOf("=");
+    if (eq <= 0) continue;
+    const name = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1).trim();
+    if (!name) continue;
+    if (!value || /^deleted$/i.test(value)) { cookies.delete(name); continue; }
+    cookies.set(name, value);
+    if (cookies.size > COOKIE_MAX) {
+      const oldest = cookies.keys().next().value;
+      if (oldest !== undefined) cookies.delete(oldest);
+    }
+  }
+}
+
+function decodeBody(buf, encoding) {
+  const enc = String(encoding || "").toLowerCase();
+  try {
+    if (enc.includes("br")) return zlib.brotliDecompressSync(buf).toString("utf8");
+    if (enc.includes("gzip")) return zlib.gunzipSync(buf).toString("utf8");
+    if (enc.includes("deflate")) return zlib.inflateSync(buf).toString("utf8");
+  } catch (e) {
+    // A truncated/odd encoding should not kill the fetch — fall through.
+  }
+  return buf.toString("utf8");
+}
+
+/* ----------------------------- host health --------------------------------
+ * Cooldowns are short for transport errors (a flaky edge recovers in seconds)
+ * and long for 403/429 (that is a decision, not a glitch). They grow
+ * geometrically with repeated failures and carry ±35 % jitter, so a retry never
+ * lands on the exact second their limiter reopened. A synchronised retry loop is
+ * the one pattern that turns a soft throttle into a hard block.
+ */
+const health = new Map();     // host -> { fails, cooldownUntil, lastOk, lastErr }
+let lastGoodHost = "";
+const COOLDOWN_MAX_MS = 30 * 60 * 1000;
+
+/* --------------------------- durable quiet state ---------------------------
+ * A crash loop is worse than a scraper: three quick restarts re-hit the host
+ * that just refused us, and that escalation is what gets a network blocked. So
+ * cooldowns and the global pause survive the process.
+ */
+const STATE_DIR = path.join(__dirname, "..", ".cache");
+const STATE_FILE = path.join(STATE_DIR, "upstream-health.json");
+let persistTimer = null;
+
+function persistHealth() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      const hosts = {};
+      const now = Date.now();
+      for (const [host, h] of health) {
+        if ((h.cooldownUntil || 0) > now) {
+          hosts[host] = { cooldownUntil: h.cooldownUntil, fails: h.fails || 1, lastErr: h.lastErr || "" };
+        }
+      }
+      const tmp = STATE_FILE + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify({ hosts, globalPauseUntil, savedAt: now }));
+      fs.renameSync(tmp, STATE_FILE);
+    } catch (e) { /* best effort — never block a fetch on disk */ }
+  }, 500);
+  if (persistTimer.unref) persistTimer.unref();
+}
+
+function hydrateHealth() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const now = Date.now();
+    let restored = 0;
+    for (const host of Object.keys((raw && raw.hosts) || {})) {
+      const h = raw.hosts[host];
+      if (!isPoolHost(host) || !h) continue;
+      if ((h.cooldownUntil || 0) <= now) continue;
+      health.set(host, { fails: h.fails || 1, cooldownUntil: h.cooldownUntil, lastErr: h.lastErr || "restored" });
+      restored++;
+    }
+    if (raw && raw.globalPauseUntil > now) globalPauseUntil = raw.globalPauseUntil;
+    if (restored) console.log("[xhFetch] restored " + restored + " host cooldown(s) from last run");
+  } catch (e) { /* a corrupt state file must never block boot */ }
+}
+
+/* --------------------------- global circuit breaker -------------------------
+ * Per-host cooldown answers "this mirror is tired". This answers "they are
+ * refusing everyone": after three refusals in a row we stop talking to the whole
+ * fleet for two minutes and let the page cache carry the site. Going quiet is
+ * the only response that makes an escalation less likely rather than more.
+ */
+let strikes = 0;
+let globalPauseUntil = 0;
+const GLOBAL_STRIKES = 3;
+const GLOBAL_PAUSE_MS = 120 * 1000;
+
+function noteRefusal() {
+  if (Date.now() < globalPauseUntil) return;
+  strikes += 1;
+  if (strikes < GLOBAL_STRIKES) return;
+  strikes = 0;
+  globalPauseUntil = Date.now() + GLOBAL_PAUSE_MS;
+  console.warn("[xhFetch] refused " + GLOBAL_STRIKES + "x — pausing all upstream fetches for " + Math.round(GLOBAL_PAUSE_MS / 1000) + "s");
+  persistHealth();
+}
+
+function jitter(ms) {
+  const spread = Math.round(ms * 0.35);
+  return Math.max(1000, ms - spread + Math.round(Math.random() * spread * 2));
+}
+
+function cooldownFor(host, err) {
+  const fails = (((health.get(host) || {}).fails) || 0) + 1;
+  const sc = err && err.status;
+  const base = sc === 403 ? 120000 : sc === 429 ? 180000 : sc >= 500 ? 30000 : 15000;
+  const grown = Math.min(COOLDOWN_MAX_MS, base * Math.pow(2, Math.min(fails - 1, 4)));
+  // Retry-After is an explicit instruction: never come back earlier than it.
+  const told = err && err.retryAfter ? Math.min(err.retryAfter, COOLDOWN_MAX_MS) : 0;
+  return jitter(Math.max(grown, told));
+}
+
+function markOk(host) {
+  const h = health.get(host) || { fails: 0 };
+  const wasCooling = (h.cooldownUntil || 0) > 0;
+  h.fails = 0;
+  h.cooldownUntil = 0;
+  h.lastOk = Date.now();
+  health.set(host, h);
+  strikes = 0;
+  if (wasCooling) persistHealth();
+  if (lastGoodHost !== host) {
+    if (lastGoodHost) console.log("[xhFetch] host switch", lastGoodHost, "->", host);
+    lastGoodHost = host;
+  }
+}
+
+function markBad(host, cooldownMs, reason) {
+  const h = health.get(host) || { fails: 0 };
+  h.fails += 1;
+  h.cooldownUntil = Math.max(h.cooldownUntil || 0, Date.now() + cooldownMs);
+  h.lastErr = String(reason || "");
+  health.set(host, h);
+  if (lastGoodHost === host) lastGoodHost = "";
+  console.warn("[xhFetch] host down", host, "-", h.lastErr, "cooldown", Math.round(cooldownMs / 1000) + "s");
+  persistHealth();
+}
+
+/** Sticky last-good first, then every host not currently cooling down. */
+function candidates() {
+  const now = Date.now();
+  const fresh = HOST_POOL.filter((h) => ((health.get(h) || {}).cooldownUntil || 0) <= now);
+  const order = [];
+  if (lastGoodHost && fresh.includes(lastGoodHost)) order.push(lastGoodHost);
+  for (const h of fresh) if (h !== lastGoodHost) order.push(h);
+  // Everything cooling down? Try anyway — a stale cooldown is not a hard answer.
+  return order.length ? order : HOST_POOL.slice();
+}
 
 /* ---------- Global soft pacing for background hits ---------- */
-const BG_GAP_MS = 1200;           // ≥1 background hit / 1.2s — burst-safe
+const BG_GAP_MS = 1200;           // ≥1 background hit / 1.2 s — burst-safe
 let bgChain = Promise.resolve();
 let lastBgHit = 0;
 
@@ -103,45 +401,169 @@ function pace(priority) {
   return bgChain;
 }
 
-/* GET a text body from xhamster.com over the pinned connection.
- * Manual redirect-follow (≤3) because undici's fetch() ignores our agent. */
-function xhFetchText(url, opts) {
-  const timeoutMs = (opts && opts.timeoutMs) || 6500;
-  const priority = (opts && opts.priority) === 0 ? 0 : 1;
+/* ------------------------------ one attempt ------------------------------- */
+function parseRetryAfter(v) {
+  if (!v) return 0;
+  const s = String(v).trim();
+  if (/^\d+$/.test(s)) return Number(s) * 1000;
+  const at = Date.parse(s);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
+}
+
+function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects) {
+  const target = "https://" + host + pathAndQuery;
+  const left = redirects == null ? 3 : redirects;
+
+  const jar = cookieHeader();
+  const sendHeaders = jar
+    ? Object.assign({}, headers, { Cookie: headers.Cookie ? headers.Cookie + "; " + jar : jar })
+    : headers;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(target, { agent: xhAgent, method: "GET", headers: sendHeaders, timeout: timeoutMs }, (res) => {
+      const sc = res.statusCode || 0;
+      if (res.headers["set-cookie"]) storeCookies(res.headers["set-cookie"]);
+
+      if (sc >= 301 && sc <= 308 && res.headers.location && left > 0) {
+        res.resume();
+        let nextHref;
+        try { nextHref = new URL(res.headers.location, target); } catch (e) { return reject(e); }
+        const nextHost = nextHref.hostname;
+        if (!isPoolHost(nextHost)) {
+          const err = new Error("redirect out of family: " + nextHost);
+          err.status = 403;
+          return reject(err);
+        }
+        return resolve(attemptOnce(nextHost, nextHref.pathname + nextHref.search, headers, timeoutMs, left - 1));
+      }
+      if (sc !== 200) {
+        res.resume();
+        const err = new Error("xh http " + sc);
+        err.status = sc;
+        const wait = parseRetryAfter(res.headers["retry-after"]);
+        if (wait) err.retryAfter = wait;
+        return reject(err);
+      }
+
+      const chunks = [];
+      let size = 0;
+      res.on("data", (c) => {
+        size += c.length;
+        if (size > 12 * 1024 * 1024) return req.destroy(new Error("body too large"));
+        chunks.push(c);
+      });
+      res.on("end", () => resolve({
+        body: decodeBody(Buffer.concat(chunks), res.headers["content-encoding"]),
+        host,
+      }));
+      res.on("error", reject);
+    });
+    req.on("timeout", () => req.destroy(new Error("xh timeout " + timeoutMs + "ms")));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * GET a page from the xHamster fleet.
+ *
+ * @param {string} url   any URL whose hostname belongs to the fleet; the host is
+ *                       replaced with whichever mirror is currently healthy.
+ * @param {object} opts  { timeoutMs, budgetMs, priority, headers, validate }
+ *                       validate(body) -> bool; a mirror that answers 200 but
+ *                       ships a block page is treated as down.
+ * @returns {Promise<string>} the body
+ */
+async function xhFetchText(url, opts) {
+  const o = opts || {};
+  const perTry = o.timeoutMs || 6500;
+  const deadline = Date.now() + (o.budgetMs || perTry + 4000);
+  const priority = o.priority === 0 ? 0 : 1;
+  const validate = typeof o.validate === "function" ? o.validate : null;
+  // Header set mirrors Chrome 125 on Windows. A bare `User-Agent` with two
+  // headers is the cheapest bot tell there is; these are the headers a real
+  // navigation actually carries.
   const headers = Object.assign({
     "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
-  }, (opts && opts.headers) || {});
+    "Accept-Encoding": "gzip, deflate, br",
+    "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24", "Google Chrome";v="125"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    Connection: "keep-alive",
+  }, o.headers || {});
 
-  // Single-shot GET with manual redirect-follow (≤3). Retries below rotate
-  // ipCache.idx so the next attempt dials the other edge IP.
-  function attemptInner(u, redirects) {
-    redirects = redirects || 0;
-    return new Promise((resolve, reject) => {
-      const req = https.request(u, { agent: xhAgent, method: "GET", headers, timeout: timeoutMs }, (res) => {
-        if (res.statusCode >= 301 && res.statusCode <= 308 && res.headers.location && redirects < 3) {
-          res.resume();
-          return resolve(attemptInner(new URL(res.headers.location, u).href, redirects + 1));
-        }
-        if (res.statusCode !== 200) { res.resume(); return reject(new Error("xh direct http " + res.statusCode)); }
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (c) => { body += c; if (body.length > 12 * 1024 * 1024) req.destroy(new Error("body too large")); });
-        res.on("end", () => resolve(body));
-        res.on("error", reject);
-      });
-      req.on("timeout", () => req.destroy(new Error("xh direct timeout")));
-      req.on("error", reject);
-      req.end();
-    });
+  let base;
+  try { base = new URL(url); } catch (e) { throw new Error("bad upstream url"); }
+  const pathAndQuery = base.pathname + base.search;
+
+  // Circuit breaker tripped: serve from cache and stay silent. Asking again 200
+  // ms later is exactly what an impatient scraper does.
+  if (Date.now() < globalPauseUntil) {
+    const err = new Error("upstream cooling down — serving cache only");
+    err.status = 503;
+    err.globalPause = true;
+    err.directFailed = true;
+    throw err;
   }
 
-  return pace(priority).then(() => attemptInner(url, 0)).catch((e1) => {
-    // one retry on the other edge IP (ECONNRESET / 520 / timeout happen)
-    ipCache.idx++;                                // rotate to the other edge
-    return pace(priority).then(() => new Promise((r) => setTimeout(r, 300))).then(() => attemptInner(url, 0));
-  }).catch((e2) => { e2.directFailed = true; throw e2; });
+  let lastErr = null;
+  let tried = 0;
+
+  for (const host of candidates()) {
+    if (tried >= 3) break;
+    const left = deadline - Date.now();
+    if (left < 900) break;
+    tried++;
+
+    await pace(priority);
+    const timeoutMs = Math.min(perTry, Math.max(1000, left));
+
+    let release;
+    try {
+      // Global governor: user-facing fetches jump the queue but still obey the
+      // hard rate cap, so a traffic spike never becomes an upstream burst.
+      release = await acquireSlot(priority, deadline);
+    } catch (e) {
+      lastErr = e;
+      break;
+    }
+
+    try {
+      const got = await attemptOnce(host, pathAndQuery, headers, timeoutMs, 3);
+      if (validate && !validate(got.body)) {
+        markBad(got.host, 60000, "invalid payload");
+        lastErr = new Error("invalid payload from " + got.host);
+        continue;
+      }
+      markOk(got.host);
+      return got.body;
+    } catch (e) {
+      lastErr = e;
+      const sc = e && e.status;
+      const st = dnsState.get(host);
+      if (st) st.idx++;                      // next try dials the other edge IP
+
+      if (sc === 404) continue;              // this mirror simply lacks the path
+      if (sc === 403 || sc === 429) noteRefusal();
+      markBad(host, cooldownFor(host, e), sc ? "http " + sc : ((e && e.message) || "error"));
+
+      // A refusal means stop asking, not try the next host immediately.
+      if (Date.now() < globalPauseUntil) break;
+    } finally {
+      if (release) release();
+    }
+  }
+
+  const err = lastErr || new Error("xh fetch failed");
+  err.directFailed = true;
+  throw err;
 }
 
 /* ---------- /api/front/search/suggest (CONFIRMED, report §6a) ---------- */
@@ -159,7 +581,12 @@ async function xhSuggest(q) {
       "Cookie": "x_csrf_token=" + suggestCsrf,
       "x-csrf-token": suggestCsrf,                // double-submit: cookie + header same value
       "x-requested-with": "XMLHttpRequest",
-      "Accept": "application/json",
+      "Accept": "application/json, text/plain, */*",
+      // This is an XHR from their own page, not a navigation — say so.
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      Referer: "https://" + XH_HOST + "/",
     },
   });
   const arr = JSON.parse(body);
@@ -173,4 +600,42 @@ async function xhSuggest(q) {
   })).filter((s) => s.text);
 }
 
-module.exports = { xhFetchText, xhSuggest, prewarmIps, resolveIps, UA };
+/* ---------- introspection ---------- */
+function poolStatus() {
+  const now = Date.now();
+  return HOST_POOL.map((host) => {
+    const h = health.get(host) || {};
+    return {
+      host,
+      available: (h.cooldownUntil || 0) <= now,
+      active: host === lastGoodHost,
+      fails: h.fails || 0,
+      cooldownMs: Math.max(0, (h.cooldownUntil || 0) - now),
+      lastOk: h.lastOk || 0,
+      lastErr: h.lastErr || "",
+    };
+  });
+}
+
+const resolveIps = (force) => resolveHost(XH_HOST, force);
+const prewarmIps = () => resolveHost(XH_HOST, false).catch(() => {});
+
+hydrateHealth();
+
+module.exports = {
+  xhFetchText,
+  xhSuggest,
+  prewarmIps,
+  resolveIps,
+  poolStatus,
+  jarStatus: () => ({
+    cookies: cookies.size,
+    inflight: inflightCount,
+    queued: waiters.length,
+    tokens: Math.round(tokens * 10) / 10,
+    quietForMs: Math.max(0, globalPauseUntil - Date.now()),
+    strikes,
+  }),
+  HOST_POOL,
+  UA,
+};

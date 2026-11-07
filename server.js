@@ -14,6 +14,7 @@ const path = require("path");
 
 const { cdnRequest, cdnGetBuffer } = require("./services/cdn-http");
 const { fullUrl, slugFromPageUrl } = require("./services/xh-core");
+const { poolStatus, jarStatus } = require("./services/xh-fetch");
 const data = require("./services/xh-data");
 
 const app = express();
@@ -26,6 +27,12 @@ app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type, Range");
+  // Visitors never touch a third-party host: every thumbnail and every HLS
+  // segment comes back through this origin. These headers keep the browser from
+  // leaking the visit (no referrer to anywhere, no powerful APIs requested).
+  res.set("Referrer-Policy", "no-referrer");
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -325,6 +332,9 @@ app.get("/api/stats", (req, res) => {
     ...data.stats,
     cachedThumbs: thumbLRU.size,
     cachedPlaylists: playlistLRU.size,
+    stalePages: data.staleSize(),
+    hosts: poolStatus(),
+    upstream: jarStatus(),
   });
 });
 
@@ -357,6 +367,8 @@ const server = app.listen(PORT, () => {
 
 function shutdown(signal) {
   console.log("\n[" + signal + "] shutting down…");
+  // Persist the last-good pages so a restart during an upstream block still boots warm.
+  try { data.flushToDisk(); } catch (e) { /* best effort */ }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }

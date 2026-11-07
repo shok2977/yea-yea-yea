@@ -80,12 +80,14 @@ async function fetchPage(url, opts) {
 
   const started = Date.now();
 
-  // 1) Direct DoH-pinned connection (measured 0.9–1.5s vs relay 3–9s).
+  // 1) Direct DoH-pinned connection through the mirror pool (0.9–1.5s vs relay
+  // 3–9s). `validate` lets the pool reject a 200 that is really a block page and
+  // fail over to the next host instead of handing garbage to the parser.
   // Transient ECONNRESET / 520 happen on the edge, so try twice before paying
   // the mirror's ~3.5s — one extra 1.2s attempt is cheaper than a relay render.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const html = await xhFetchText(url, { timeoutMs, priority });
+      const html = await xhFetchText(url, { timeoutMs, priority, validate: isValidHtml });
       if (isValidHtml(html)) {
         const ms = Date.now() - started;
         if (ms > 2000) console.log("[xh] direct slow", ms + "ms", url.slice(-60));
@@ -95,17 +97,26 @@ async function fetchPage(url, opts) {
       break;
     } catch (e) {
       console.warn("[xh] direct attempt", attempt + 1, "failed:", e.message, url.slice(-60));
+      // The pool already walked its whole mirror list inside this call; retrying
+      // from here would multiply the wait by the number of hosts for nothing.
+      if (e && e.directFailed) break;
       if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
     }
   }
 
-  // 2) Mirrors race — whichever renders a valid page first.
+  // 2) Third-party text relay. Off with XH_NO_RELAY=1 — it hands the requested
+  // URL to someone else's service, which some deployments will not accept.
+  if (process.env.XH_NO_RELAY === "1") {
+    throw Object.assign(new Error("upstream blocked (relay disabled)"), { status: 502 });
+  }
+
+  // 3) Mirrors race — whichever renders a valid page first.
   try {
     const html = await Promise.any([fetchViaRelay(url, 9), fetchViaAllOrigins(url)]);
     console.log("[xh] served via mirror in", Date.now() - started + "ms", url.slice(-60));
     return html;
   } catch (e) {
-    // 3) One sequential relay retry (transient 502/520 happen upstream).
+    // 4) One sequential relay retry (transient 502/520 happen upstream).
     return fetchViaRelay(url, 10);
   }
 }

@@ -1,0 +1,22 @@
+(async () => {
+  const j = await (await fetch("http://localhost:3080/api/videos?category=top&page=1&limit=40")).json();
+  const c = (j.videos || []).find((x) => x.stream) || {};
+  const u = c.stream;
+  console.log("m3u8:", String(u).slice(0, 110));
+  if (!u) return;
+  const O = { Origin: "http://localhost:3080" };
+  const r = await fetch(u, { headers: O });
+  console.log("master", r.status, "acao=" + r.headers.get("access-control-allow-origin"), "ct=" + r.headers.get("content-type"));
+  const body = await r.text();
+  const lvl = body.split("\n").map((s) => s.trim()).find((s) => s && !s.startsWith("#"));
+  const lu = new URL(lvl, u).href;
+  const r2 = await fetch(lu, { headers: O });
+  console.log("level", r2.status, "acao=" + r2.headers.get("access-control-allow-origin"));
+  const lb = await r2.text();
+  const seg = lb.split("\n").map((s) => s.trim()).filter((s) => s && !s.startsWith("#") && !s.includes(".m3u8")).pop();
+  const su = new URL(seg, lu).href;
+  const s = Date.now();
+  const r3 = await fetch(su, { headers: O });
+  const b = Buffer.from(await r3.arrayBuffer());
+  console.log("segment", r3.status, Date.now() - s + "ms", b.length + "B", "acao=" + r3.headers.get("access-control-allow-origin"), "cc=" + r3.headers.get("cache-control"));
+})();
