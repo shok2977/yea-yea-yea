@@ -1,0 +1,1 @@
+{"hosts":{"xhamster.com":{"cooldownUntil":1794219028826,"fails":1,"lastErr":"read ECONNRESET"}},"dnsPins":{"xhamster.com":{"ips":["104.16.4.81","104.16.3.81"],"ts":1794219018178},"xhamster.desi":{"ips":["104.21.69.7","172.67.202.84"],"ts":1794219018264}},"globalPauseUntil":null,"savedAt":1794219018680}

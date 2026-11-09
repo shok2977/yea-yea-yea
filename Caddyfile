@@ -1,0 +1,39 @@
+# Caddy in front of the TubeStream replicas.
+#
+# Load balancing is least_conn (pages are I/O-bound, not CPU-bound), with an
+# active health check so a failing replica leaves rotation on its own instead of
+# taking a share of requests with it. Redis is what makes the replicas
+# interchangeable: shared page cache + one adaptive upstream budget.
+#
+# TLS: to serve a real domain, replace the `:80` site address below with your
+# domain (e.g. `example.com`) and publish port 443 in docker-compose.yml.
+# Caddy then obtains and renews the certificate automatically.
+
+:80 {
+	# HTTP/1.1, HTTP/2 and HTTP/3 (QUIC). HTTP/3 needs UDP 443 published in
+	# docker-compose.yml when you serve a real domain with TLS.
+	protocols h1 h2 h3
+	encode zstd gzip
+
+	reverse_proxy app:8080 {
+		lb_policy least_conn
+		health_uri /api/health
+		health_interval 10s
+		health_timeout 3s
+		health_status 200
+		fail_duration 15s
+		max_fails 2
+
+		# HLS segments/playlists are streamed, not buffered: flush each chunk so
+		# playback starts immediately instead of after a proxy buffer fills.
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+
+	# Never let a proxy cache an API answer; the app owns its cache semantics.
+	@api path /api/*
+	header @api Cache-Control "no-store"
+}

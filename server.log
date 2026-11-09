@@ -15,3 +15,19 @@ TubeStream listening on http://localhost:3001
 [HTTP] GET /api/stream?url=https%3A%2F%2Fvideo-nss.xhmediacdn.com%2FNk4DUU1FOYH_30ptcNUOGQ%3D%3D%2C1794052800%2Fmedia%3Dhls4%2Fmulti%3D256x144%3A144p%2C426x240%3A240p%2F031%2F489%2F696%2F144p.h264.mp4.m3u8 200 403ms
 [xhFetch] DoH xhamster.com -> 104.16.3.81, 104.16.4.81
 [HTTP] GET /api/feed?tab=newest&page=1 200 1142ms
+[xhFetch] DoH xhamster.com -> 104.16.3.81, 104.16.4.81
+[HTTP] GET /api/watch/don-t-resist-to-my-webcam-curves-xhmPHz0 200 1164ms
+[xhFetch] host down xhamster.com - xh timeout 7000ms cooldown 13s
+[xhFetch] DoH xhamster.desi -> 172.67.202.84, 104.21.69.7
+[xh] direct slow 8184ms https://xhamster.com/newest
+[HTTP] GET /api/feed?tab=newest 200 8195ms
+[xhFetch] DoH xhamster.desi -> 104.21.69.7, 172.67.202.84
+[xhFetch] host down xhamster.desi - read ECONNRESET cooldown 17s
+[xhFetch] DoH xhamster.com -> 104.16.4.81, 104.16.3.81
+[HTTP] GET /api/feed?tab=popular&page=1 200 1156ms
+[xhFetch] host switch xhamster.desi -> xhamster.com
+[HTTP] GET /api/feed?tab=newest&page=1 200 1328ms
+[xhFetch] host switch xhamster.com -> xhamster.desi
+[HTTP] GET /api/feed?tab=hot&page=1 200 1695ms
+[HTTP] GET /api/category/footjob?page=1 200 1013ms
+[HTTP] GET /api/watch/new-sexy-hot-wife-fuck-in-my-bedroom-hard-fucking-video-hindi-clean-audio-xxx-xhdXf9v 200 983ms

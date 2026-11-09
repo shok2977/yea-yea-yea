@@ -15,6 +15,10 @@ const { unmask, looksHexMasked } = require("./xh-decrypt");
 
 const SITE = "https://xhamster.com";
 const RELAY_BASE = "https://r.jina.ai/";
+/* Third-party render relay. Disabled by default: it is handed the exact URL the
+ * visitor asked for (search terms included), it makes the request from its own
+ * address, and it cannot be trusted to keep either secret. XH_RELAY=1 opts in. */
+const RELAY_ENABLED = process.env.XH_RELAY === "1";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
@@ -53,23 +57,6 @@ async function fetchViaRelay(url, timeoutSec) {
   return html;
 }
 
-async function fetchViaAllOrigins(url) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 12000);
-  try {
-    const res = await fetch("https://api.allorigins.win/raw?url=" + encodeURIComponent(url), {
-      headers: { "User-Agent": UA },
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error("allorigins " + res.status);
-    const html = await res.text();
-    if (!isValidHtml(html)) throw new Error("allorigins: invalid render");
-    return html;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
 /**
  * Fetch one xhamster page and return its HTML.
  * priority 0 = the user is waiting (click / search), 1 = page-level background.
@@ -77,6 +64,18 @@ async function fetchViaAllOrigins(url) {
 async function fetchPage(url, opts) {
   const priority = opts && opts.priority === 0 ? 0 : 1;
   const timeoutMs = (opts && opts.timeoutMs) || 7000;
+  const meta = !!(opts && opts.meta);
+  const validators = (opts && opts.validators) || null;
+  // meta callers get { notModified, html, etag, lastModified } so the data layer
+  // can keep HTTP validators and revalidate instead of re-downloading.
+  const shape = (html, res) => (meta
+    ? {
+        notModified: false, html,
+        etag: (res && res.etag) || "",
+        lastModified: (res && res.lastModified) || "",
+        cacheControl: (res && res.cacheControl) || "",
+      }
+    : html);
 
   const started = Date.now();
 
@@ -87,11 +86,22 @@ async function fetchPage(url, opts) {
   // the mirror's ~3.5s — one extra 1.2s attempt is cheaper than a relay render.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const html = await xhFetchText(url, { timeoutMs, priority, validate: isValidHtml });
+      const res = await xhFetchText(url, { timeoutMs, priority, validate: isValidHtml, validators, meta });
+      // 304: our parsed copy is still current. Nothing downloaded, nothing parsed.
+      if (meta && res && res.notModified) {
+        return {
+          notModified: true,
+          html: null,
+          etag: res.etag || (validators && validators.etag) || "",
+          lastModified: res.lastModified || (validators && validators.lastModified) || "",
+          cacheControl: res.cacheControl || "",
+        };
+      }
+      const html = meta ? res.body : res;
       if (isValidHtml(html)) {
         const ms = Date.now() - started;
         if (ms > 2000) console.log("[xh] direct slow", ms + "ms", url.slice(-60));
-        return html;
+        return shape(html, res);
       }
       console.warn("[xh] direct invalid payload", url.slice(-60));
       break;
@@ -104,20 +114,19 @@ async function fetchPage(url, opts) {
     }
   }
 
-  // 2) Third-party text relay. Off with XH_NO_RELAY=1 — it hands the requested
-  // URL to someone else's service, which some deployments will not accept.
-  if (process.env.XH_NO_RELAY === "1") {
-    throw Object.assign(new Error("upstream blocked (relay disabled)"), { status: 502 });
+  // 2) Third-party render relay — opt-in only. Off by default so a blocked
+  // upstream degrades to the stale cache instead of leaking what was asked for.
+  if (!RELAY_ENABLED) {
+    throw Object.assign(new Error("upstream blocked (third-party relay disabled)"), { status: 502 });
   }
 
-  // 3) Mirrors race — whichever renders a valid page first.
+  // 3) Relay, then one sequential retry (transient 502/520 happen upstream).
   try {
-    const html = await Promise.any([fetchViaRelay(url, 9), fetchViaAllOrigins(url)]);
-    console.log("[xh] served via mirror in", Date.now() - started + "ms", url.slice(-60));
-    return html;
+    const html = await fetchViaRelay(url, 9);
+    console.log("[xh] served via relay in", Date.now() - started + "ms", url.slice(-60));
+    return shape(html, null);
   } catch (e) {
-    // 4) One sequential relay retry (transient 502/520 happen upstream).
-    return fetchViaRelay(url, 10);
+    return shape(await fetchViaRelay(url, 10), null);
   }
 }
 

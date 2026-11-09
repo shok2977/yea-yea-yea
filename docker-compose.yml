@@ -1,0 +1,59 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Cluster state: shared page cache (L2), one adaptive upstream budget for the
+    # whole fleet, and fleet-wide host cooldowns. The app also runs without it
+    # (per-process fallback), but replicas only share state when it is present.
+    command: ["redis-server", "--maxmemory-policy", "allkeys-lru", "--maxmemory", "512mb"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8080"
+      # Wired automatically; override in .env for an external Redis.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Horizontal scale-out: `docker compose up -d --scale app=4` (or APP_REPLICAS=4).
+    # Replicas publish no host port — Caddy balances across them, so changing the
+    # count never collides on 8080.
+    expose:
+      - "8080"
+    deploy:
+      replicas: ${APP_REPLICAS:-2}
+    volumes:
+      # Page cache, DNS pins and the two signing keys. The keys MUST be identical
+      # across replicas, otherwise a media handle minted by one replica is
+      # rejected by another — that is why this volume is shared on purpose.
+      - tubestream-cache:/app/.cache
+    mem_limit: 1g
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    # Caddy faces the internet (or cloudflared); the app is never published raw.
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  tubestream-cache:
+  redis-data:
+  caddy-data:
+  caddy-config:

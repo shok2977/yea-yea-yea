@@ -1,0 +1,56 @@
+[TEMPLATE]
+# Copy to .env on the server (never commit that file) and fill in the blanks.
+# The site is PUBLIC by default: with ACCESS_CODES empty there is no login wall
+# and any visitor can use it.
+
+PORT=8080
+
+# OPTIONAL invite-only mode. Leave empty for a fully public site.
+# If set, only the listed codes can log in (one code per person/group).
+ACCESS_CODES=
+
+# Cluster state. Set REDIS_URL to share page cache + adaptive upstream budget
+# + host cooldowns across replicas. Without it each process runs solo.
+REDIS_URL=redis://127.0.0.1:6379
+
+# Adaptive upstream budget. There is NO fixed requests-per-minute ceiling at our
+# layer: the limit starts here and grows ~1% per successful upstream response
+# up to UPSTREAM_BUDGET_MAX_PER_MIN, shrinking back only on 403/429 refusals.
+# Cached responses never touch the budget. 0 disables the budget entirely.
+UPSTREAM_BUDGET_PER_MIN=300
+UPSTREAM_BUDGET_MAX_PER_MIN=6000
+UPSTREAM_BUDGET_BURST=1200
+
+# Visitor per-IP rate limits. AUTO=1 (default) gives thousands/min — high enough
+# that real browsing is never capped. RATE_LIMIT_AUTO=0 restores strict caps.
+RATE_LIMIT_AUTO=1
+
+# Ban-avoidance breaker. After repeated 403/429 the whole fleet goes quiet for a
+# while and serves cache only; the pause doubles on every repeat (2m, 4m, … up to
+# this cap) and any success resets it. Going quiet is what stops a rate limit
+# from escalating into an IP block.
+UPSTREAM_PAUSE_BASE_MS=120000
+UPSTREAM_PAUSE_MAX_MS=600000
+
+# Optional fixed keys. Without them the app creates .cache/session-secret and
+# .cache/proxy-secret on first boot; set these to keep sessions and media links
+# valid across rebuilds on hosts with ephemeral disks.
+SESSION_SECRET=
+PROXY_SECRET=
+
+# Optional rotating egress. Any HTTP(S) or SOCKS5 proxy URLs. Leave empty for
+# direct egress (default). A rotating gateway is one entry.
+EGRESS_PROXIES=
+PROXY_HTTP_URL=
+PROXY_SOCKS5_URL=
+# pages (default) | pages,thumbs | all
+EGRESS_SCOPE=pages
+
+# Behind Caddy/Nginx/Cloudflare set 1 so client IPs and req.secure are correct.
+TRUST_PROXY=1
+
+# Same-origin by default. Only add origins that must call the API from a browser.
+ALLOWED_ORIGINS=
+
+# Third-party text relay fallback for page fetches: off by default (privacy).
+XH_RELAY=0

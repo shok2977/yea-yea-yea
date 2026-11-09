@@ -8,8 +8,11 @@
  */
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { fetchPage, parseListing, parseVideoPage, SITE } = require("./xh-core");
 const { xhSuggest } = require("./xh-fetch");
+const { takeUpstream } = require("./guard");
+const shared = require("./shared");
 
 const LISTING_TTL_MS = 3 * 60 * 1000;   // listings change constantly
 // Stream tokens stay valid for hours (the `end=` epoch in the m3u8 URL), so a
@@ -42,20 +45,35 @@ const DISK_MAX_ENTRIES = 120;
 const DISK_MAX_BYTES = 8 * 1024 * 1024;
 const FLUSH_DEBOUNCE_MS = 2500;
 
-const stats = { listingHits: 0, listingMisses: 0, watchHits: 0, watchMisses: 0, upstreamPages: 0, staleServes: 0 };
+const stats = {
+  listingHits: 0, listingMisses: 0, watchHits: 0, watchMisses: 0,
+  upstreamPages: 0, staleServes: 0, swrServes: 0, refreshFailures: 0,
+  revalidated: 0, unchanged: 0,
+};
 
-function remember(key, value, ttlMs, staleTtlMs) {
+function remember(key, value, ttlMs, staleTtlMs, validators) {
   if (cache.size >= MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
-  cache.set(key, { ts: Date.now(), ttl: ttlMs, value });
+  const now = Date.now();
+  const etag = (validators && validators.etag) || "";
+  const lastModified = (validators && validators.lastModified) || "";
+  const hash = (validators && validators.hash) || "";
+  const cacheControl = (validators && validators.cacheControl) || "";
+  cache.set(key, { ts: now, ttl: ttlMs, value });
   if (stale.size >= MAX_STALE) {
     const oldest = stale.keys().next().value;
     if (oldest !== undefined) stale.delete(oldest);
   }
   stale.delete(key);
-  stale.set(key, { ts: Date.now(), value, staleTtl: staleTtlMs || STALE_TTL_MS });
+  // etag/lastModified ride along with the entry: they are what turns the next
+  // refresh into a conditional GET (304, no body) instead of a full download.
+  stale.set(key, { ts: now, value, staleTtl: staleTtlMs || STALE_TTL_MS, etag, lastModified, hash, cacheControl });
+  // Cluster L2: replicas share this entry. Fire-and-forget, never blocks.
+  shared.pageSet(key, {
+    ts: now, ttl: ttlMs, value, staleTtl: staleTtlMs || STALE_TTL_MS, etag, lastModified, hash, cacheControl,
+  });
   scheduleFlush();
 }
 
@@ -63,11 +81,42 @@ function entryStaleTtl(entry) {
   return (entry && entry.staleTtl) || STALE_TTL_MS;
 }
 
-function recallStale(key) {
+function staleEntry(key) {
   const hit = stale.get(key);
   if (!hit) return null;
   if (Date.now() - hit.ts > entryStaleTtl(hit)) { stale.delete(key); return null; }
-  return hit.value;
+  return hit;
+}
+
+function recallStale(key) {
+  const hit = staleEntry(key);
+  return hit ? hit.value : null;
+}
+
+/** Stale entry (with HTTP validators) from the cluster L2, if this replica does
+ *  not hold one itself. */
+async function staleEntryShared(key) {
+  const e = await shared.pageStaleGet(key, true);
+  return e && e.value
+    ? { ts: 0, value: e.value, etag: e.etag, lastModified: e.lastModified, hash: e.hash }
+    : null;
+}
+
+/* xHamster sends neither ETag nor Last-Modified (verified live), so conditional
+ * GETs cannot save bytes there. These two helpers are the equivalent we control:
+ * a content hash (did the bytes change?) and the page's own Cache-Control
+ * max-age (how long may we hold it?) instead of a hard-coded guess. */
+function sha1(s) {
+  return crypto.createHash("sha1").update(s).digest("hex");
+}
+
+const MAX_TTL_MS = 30 * 60 * 1000;
+function ttlFor(res, fallback) {
+  const cc = String((res && res.cacheControl) || "");
+  const m = cc.match(/(?:^|,)\s*max-age\s*=\s*(\d+)/i);
+  if (!m) return fallback;
+  const ms = Number(m[1]) * 1000;
+  return ms > 0 ? Math.min(MAX_TTL_MS, ms) : fallback;
 }
 
 /* ---------- durable snapshot (survives restart while upstream is blocked) ---------- */
@@ -87,7 +136,10 @@ function hydrateFromDisk() {
       if (!entry || !entry.value || !entry.ts) continue;
       const ttl = (entry.staleTtl || STALE_TTL_MS);
       if (now - entry.ts > ttl) continue;
-      stale.set(key, { ts: entry.ts, value: entry.value, staleTtl: ttl });
+      stale.set(key, {
+        ts: entry.ts, value: entry.value, staleTtl: ttl,
+        etag: entry.etag || "", lastModified: entry.lastModified || "", hash: entry.hash || "",
+      });
       loaded++;
     }
     if (loaded) console.log("[data] hydrated " + loaded + " cached pages from disk");
@@ -135,6 +187,20 @@ function recall(key) {
   cache.delete(key);          // refresh recency
   cache.set(key, hit);
   return hit.value;
+}
+
+/** L2 fresh lookup (cluster). Returns a value or null; populates L1. */
+async function recallShared(key) {
+  const v = await shared.pageGet(key);
+  if (!v) return null;
+  // Rehydrate L1 so later hits on this replica are local.
+  cache.set(key, { ts: Date.now(), ttl: 60 * 1000, value: v });
+  return v;
+}
+
+/** L2 stale lookup (cluster). */
+async function recallStaleShared(key) {
+  return shared.pageStaleGet(key);
 }
 
 async function singleFlight(key, work) {
@@ -240,16 +306,53 @@ function categoryTree() {
 }
 
 /* ---------- listings ---------- */
-async function listing({ url, key, page, priority }) {
-  const cacheKey = key + ":" + page;
-  const hit = recall(cacheKey);
-  if (hit) { stats.listingHits++; return { ...hit, cached: true }; }
-
-  return singleFlight(cacheKey, async () => {
+/* One upstream fetch + parse. Only ever called inside singleFlight(), so any
+ * number of visitors asking for the same page at the same moment still costs
+ * exactly one upstream request. */
+async function fetchListing({ url, cacheKey, page, priority }) {
     stats.listingMisses++;
+    const prevEntry = staleEntry(cacheKey) || (await staleEntryShared(cacheKey));
+    // Adaptive cluster budget on cache-missing page fetches. The budget starts
+    // low and grows while upstream answers; when it runs dry the data layer
+    // serves its stale copy (or a clean 503) instead of spending a request
+    // that could push our egress into a block.
+    if (!(await takeUpstream())) {
+      if (prevEntry) { stats.staleServes++; return { ...prevEntry.value, cached: true, stale: true, busy: true }; }
+      throw Object.assign(new Error("busy — upstream budget exhausted, retry shortly"), { status: 503, retryAfter: 5000 });
+    }
     stats.upstreamPages++;
     try {
-      const html = await fetchPage(url, { priority: priority === 0 ? 0 : 1 });
+      // Conditional GET: if we already parsed this page, ask whether it changed.
+      // 304 = no body, no parse, and upstream barely sees the request.
+      const res = await fetchPage(url, {
+        priority: priority === 0 ? 0 : 1,
+        meta: true,
+        validators: prevEntry ? { etag: prevEntry.etag, lastModified: prevEntry.lastModified } : null,
+      });
+      if (res.notModified && prevEntry) {
+        remember(cacheKey, prevEntry.value, LISTING_TTL_MS, undefined, {
+          etag: res.etag || prevEntry.etag,
+          lastModified: res.lastModified || prevEntry.lastModified,
+          hash: prevEntry.hash,
+          cacheControl: res.cacheControl,
+        });
+        stats.revalidated++;
+        return { ...prevEntry.value, cached: true, revalidated: true };
+      }
+      const html = res.html || "";
+      const meta = {
+        etag: res.etag,
+        lastModified: res.lastModified,
+        hash: sha1(html),
+        cacheControl: res.cacheControl,
+      };
+      // Identical bytes to what we already parsed: refresh the clock and hand
+      // back the parsed copy — no second parse, no cache rewrite storm.
+      if (prevEntry && prevEntry.hash && prevEntry.hash === meta.hash) {
+        remember(cacheKey, prevEntry.value, ttlFor(res, LISTING_TTL_MS), undefined, meta);
+        stats.unchanged++;
+        return { ...prevEntry.value, cached: true, unchanged: true };
+      }
       const parsed = parseListing(html);
       const value = {
         videos: parsed.cards,
@@ -257,16 +360,39 @@ async function listing({ url, key, page, priority }) {
         lastPage: Math.max(parsed.lastPage, page),
         total: parsed.total,
       };
-      if (value.videos.length) remember(cacheKey, value, LISTING_TTL_MS);
+      if (value.videos.length) {
+        remember(cacheKey, value, ttlFor(res, LISTING_TTL_MS), undefined, meta);
+      }
       return { ...value, cached: false };
     } catch (e) {
-      const prev = recallStale(cacheKey);
+      const prev = recallStale(cacheKey) || (await recallStaleShared(cacheKey));
       if (!prev) throw e;
       stats.staleServes++;
       console.warn("[data] upstream failed for", cacheKey, "— serving stale:", e.message);
       return { ...prev, cached: true, stale: true };
     }
-  });
+}
+
+async function listing({ url, key, page, priority }) {
+  const cacheKey = key + ":" + page;
+  const hit = recall(cacheKey) || (await recallShared(cacheKey));
+  if (hit) { stats.listingHits++; return { ...hit, cached: true }; }
+
+  /* Stale-while-revalidate. A page we have served before is returned
+   * immediately and refreshed in the background, so a traffic spike never turns
+   * into a queue of visitors waiting on upstream — and never into a burst of
+   * upstream calls either (the refresh is single-flight, one per page).
+   * While the breaker is open, takeUpstream() refuses, so the refresh quietly
+   * does nothing and the cached copy keeps serving: no retries, no new refusals. */
+  const prev = recallStale(cacheKey) || (await recallStaleShared(cacheKey));
+  if (prev) {
+    stats.swrServes++;
+    singleFlight(cacheKey, () => fetchListing({ url, cacheKey, page, priority }))
+      .catch(() => { stats.refreshFailures++; });
+    return { ...prev, cached: true, stale: true, refreshing: true };
+  }
+
+  return singleFlight(cacheKey, () => fetchListing({ url, cacheKey, page, priority }));
 }
 
 function feed({ tab, page, priority }) {
@@ -293,32 +419,98 @@ function search({ q, page, priority }) {
   // which use path segments.
   return listing({
     url: SITE + "/search/" + encodeURIComponent(keyword) + (p > 1 ? "?page=" + p : ""),
-    key: "search:" + keyword.toLowerCase(),
+    // Hash the query into the cache key: the on-disk snapshot must never become
+    // a plaintext log of everything anyone searched for on this server.
+    key: "search:" + crypto.createHash("sha1").update(keyword.toLowerCase()).digest("hex").slice(0, 24),
     page: p,
     priority,
   }).then((r) => ({ ...r, q: keyword }));
 }
 
+/* Drop one watch page from every cache layer (fresh, stale, L2). The cached
+ * stream URL is a signed token: when it expires, /api/watch busts the entry
+ * and the next watch() fetches a fresh signature. */
+function forgetWatch(slug) {
+  const clean = String(slug || "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(clean) || clean.includes("..")) return false;
+  const key = "watch:" + clean;
+  cache.delete(key);
+  stale.delete(key);
+  shared.pageDel(key);
+  return true;
+}
+
 /* ---------- watch (the click path) ---------- */
 async function watch({ slug }) {
-  const clean = String(slug || "").replace(/[^A-Za-z0-9._-]/g, "");
-  if (!clean) throw Object.assign(new Error("invalid video"), { status: 400 });
+  const clean = String(slug || "").trim();
+  // Reject rather than silently rewrite: the old sanitiser kept dots, so ".."
+  // became a different upstream path (`/videos/..` normalises to `/`) than the
+  // one the caller asked for, and arbitrary junk still cost an upstream fetch.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(clean) || clean.includes("..")) {
+    throw Object.assign(new Error("invalid video"), { status: 400 });
+  }
   const cacheKey = "watch:" + clean;
-  const hit = recall(cacheKey);
+  const hit = recall(cacheKey) || (await recallShared(cacheKey));
   if (hit) { stats.watchHits++; return { ...hit, cached: true }; }
 
-  return singleFlight(cacheKey, async () => {
+  // Same stale-while-revalidate rule as listings: the player opens instantly on
+  // the last known stream and the page is refreshed in the background.
+  const prev = recallStale(cacheKey) || (await recallStaleShared(cacheKey));
+  if (prev) {
+    stats.swrServes++;
+    singleFlight(cacheKey, () => fetchWatch(clean, cacheKey)).catch(() => { stats.refreshFailures++; });
+    return { ...prev, cached: true, stale: true, refreshing: true };
+  }
+
+  return singleFlight(cacheKey, () => fetchWatch(clean, cacheKey));
+}
+
+/* One upstream watch fetch + parse; single-flight and budget-gated like listings. */
+async function fetchWatch(clean, cacheKey) {
     stats.watchMisses++;
+    const prevEntry = staleEntry(cacheKey) || (await staleEntryShared(cacheKey));
+    if (!(await takeUpstream())) {
+      if (prevEntry) { stats.staleServes++; return { ...prevEntry.value, cached: true, stale: true, busy: true }; }
+      throw Object.assign(new Error("busy — upstream budget exhausted, retry shortly"), { status: 503, retryAfter: 5000 });
+    }
     stats.upstreamPages++;
-    let html;
+    let res;
     try {
-      html = await fetchPage(SITE + "/videos/" + clean, { priority: 0 });
+      res = await fetchPage(SITE + "/videos/" + clean, {
+        priority: 0,
+        meta: true,
+        validators: prevEntry ? { etag: prevEntry.etag, lastModified: prevEntry.lastModified } : null,
+      });
     } catch (e) {
-      const prev = recallStale(cacheKey);
+      const prev = recallStale(cacheKey) || (await recallStaleShared(cacheKey));
       if (!prev) throw e;
       stats.staleServes++;
       console.warn("[data] upstream failed for", cacheKey, "— serving stale:", e.message);
       return { ...prev, cached: true, stale: true };
+    }
+    // 304: the stream page is unchanged, so the signed playlist we already hold
+    // is still good. Extend its replay window instead of re-downloading it.
+    if (res.notModified && prevEntry) {
+      remember(cacheKey, prevEntry.value, WATCH_TTL_MS, STREAM_REPLAY_TTL_MS, {
+        etag: res.etag || prevEntry.etag,
+        lastModified: res.lastModified || prevEntry.lastModified,
+        hash: prevEntry.hash,
+        cacheControl: res.cacheControl,
+      });
+      stats.revalidated++;
+      return { ...prevEntry.value, cached: true, revalidated: true };
+    }
+    const html = res.html || "";
+    const meta = {
+      etag: res.etag,
+      lastModified: res.lastModified,
+      hash: sha1(html),
+      cacheControl: res.cacheControl,
+    };
+    if (prevEntry && prevEntry.hash && prevEntry.hash === meta.hash) {
+      remember(cacheKey, prevEntry.value, ttlFor(res, WATCH_TTL_MS), STREAM_REPLAY_TTL_MS, meta);
+      stats.unchanged++;
+      return { ...prevEntry.value, cached: true, unchanged: true };
     }
     const parsed = parseVideoPage(html);
     // A page that parsed to nothing is a missing/removed video, not a stream we
@@ -339,27 +531,40 @@ async function watch({ slug }) {
     // signature is still valid — otherwise a blocked upstream would serve a dead
     // player instead of an honest error.
     if (value.stream || value.unsupported) {
-      remember(cacheKey, value, WATCH_TTL_MS, STREAM_REPLAY_TTL_MS);
+      remember(cacheKey, value, WATCH_TTL_MS, STREAM_REPLAY_TTL_MS, meta);
     }
     return { ...value, cached: false };
-  });
 }
 
 /* ---------- suggestions ---------- */
 const suggestCache = new Map();
+const suggestInflight = new Map();
+
 async function suggest(q) {
   const clean = String(q || "").trim().slice(0, 50);
   if (clean.length < 2) return [];
   const key = clean.toLowerCase();
   const hit = suggestCache.get(key);
   if (hit && Date.now() - hit.ts < SUGGEST_TTL_MS) return hit.items;
-  const items = await xhSuggest(clean);
-  suggestCache.set(key, { ts: Date.now(), items });
-  if (suggestCache.size > 150) {
-    const oldest = suggestCache.keys().next().value;
-    if (oldest !== undefined) suggestCache.delete(oldest);
-  }
-  return items;
+  // Two people typing the same prefix at the same moment must be one upstream
+  // call, not two.
+  const running = suggestInflight.get(key);
+  if (running) return running;
+  // Suggestions are the least valuable upstream call: never spend the last of
+  // the budget, and never spend any of it while cooldown is active.
+  if (!(await takeUpstream())) return [];
+  const job = xhSuggest(clean)
+    .then((items) => {
+      suggestCache.set(key, { ts: Date.now(), items });
+      if (suggestCache.size > 150) {
+        const oldest = suggestCache.keys().next().value;
+        if (oldest !== undefined) suggestCache.delete(oldest);
+      }
+      return items;
+    })
+    .finally(() => suggestInflight.delete(key));
+  suggestInflight.set(key, job);
+  return job;
 }
 
 hydrateFromDisk();
@@ -371,6 +576,7 @@ module.exports = {
   category,
   search,
   watch,
+  forgetWatch,
   suggest,
   categoryTree,
   categoryInfo,

@@ -44,19 +44,12 @@
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : 0;
   }
-  function thumbUrl(u) {
-    return u ? "/api/thumb?url=" + encodeURIComponent(u) : "";
-  }
-
-  /* Thumbnails sit on the same CDN zone as the video and need no CORS — an <img>
-   * renders a cross-origin picture even though scripting cannot read it. So the
-   * grid loads them straight from the source too. The first failure switches the
-   * rest of the session back to /api/thumb. */
-  let thumbDirectOff = false;
-
+  /* Thumbnails arrive as same-origin /api/thumb handles minted by the server.
+   * The browser must never load (or fall back to) the raw CDN URL: that would
+   * put the visitor's own IP in front of xHamster's CDN, which is how a user —
+   * not just this server — gets identified and blocked. */
   function thumbSrc(u) {
-    if (!u) return "";
-    return thumbDirectOff ? thumbUrl(u) : u;
+    return u || "";
   }
   function fmtViews(n) {
     if (!n && n !== 0) return "";
@@ -92,6 +85,12 @@
     }
     try {
       const res = await fetch(path, { signal: ctrl.signal, headers: { Accept: "application/json" } });
+      // Invite session expired: send the tab to the gate instead of rendering
+      // "Request failed (401)" over an empty grid.
+      if (res.status === 401) {
+        location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search);
+        throw new Error("Sign in required");
+      }
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.success === false) throw new Error(data.error || "Request failed (" + res.status + ")");
       return data;
@@ -194,8 +193,7 @@
       '<a class="card" href="' + href + '" data-link>' +
         '<div class="thumb">' +
           (v.thumb
-            ? '<img loading="lazy" decoding="async" alt="" referrerpolicy="no-referrer" src="' + esc(thumbSrc(v.thumb)) + '"' +
-              (thumbDirectOff ? "" : ' data-fb="' + esc(thumbUrl(v.thumb)) + '"') + ">"
+            ? '<img loading="lazy" decoding="async" alt="" referrerpolicy="no-referrer" src="' + esc(thumbSrc(v.thumb)) + '">'
             : '<div class="thumb-fallback">▶</div>') +
           '<div class="play-pip"><span>▶</span></div>' +
           (v.duration ? '<span class="badge dur">' + esc(v.duration) + "</span>" : "") +
@@ -213,15 +211,6 @@
       if (img.complete && img.naturalWidth) done();
       else img.addEventListener("load", done, { once: true });
       img.addEventListener("error", function onErr() {
-        // Direct CDN unreachable here — retry this one through the proxy and stop
-        // trying direct for the rest of the session.
-        const fb = img.getAttribute("data-fb");
-        if (fb) {
-          thumbDirectOff = true;
-          img.removeAttribute("data-fb");
-          img.src = fb;
-          return;
-        }
         img.removeEventListener("error", onErr);
         img.style.display = "none";
         const wrap = img.parentElement;
@@ -447,9 +436,10 @@
     if (v.author) stats.push(esc(v.author));
     $("watchStats").innerHTML = stats.join('<span class="sep"></span>');
 
-    $("watchActions").innerHTML =
-      '<button class="btn primary" id="copyBtn">Copy link</button>' +
-      '<a class="btn" href="' + esc(data.pageUrl || "#") + '" target="_blank" rel="noopener">Open source ↗</a>';
+    // No outbound link to the source site: clicking it would hand the visitor's
+    // IP (and their interest in this video) straight back to xHamster, which is
+    // the one thing this front end exists to prevent.
+    $("watchActions").innerHTML = '<button class="btn primary" id="copyBtn">Copy link</button>';
     const copyBtn = $("copyBtn");
     if (copyBtn) {
       copyBtn.addEventListener("click", async () => {
@@ -484,21 +474,26 @@
       return;
     }
 
-    if (v.thumb) {
-      const el = $("player");
-      const poster = thumbSrc(v.thumb);
-      el.poster = poster;
-      // <video poster> never reports a load failure, so probe it once and fall
-      // back to the proxy when the CDN picture does not arrive.
-      const probe = new Image();
-      probe.onerror = () => { if (el) el.poster = thumbUrl(v.thumb); };
-      probe.src = poster;
-    }
+    if (v.thumb) $("player").poster = thumbSrc(v.thumb);
 
     try {
       await playStream($("player"), data.stream.url, signal);
       msg.classList.add("hidden");
     } catch (e) {
+      if (signal.aborted) return;
+      // One retry with a freshly minted handle. The ?fresh=1 URL is not in the
+      // service worker's cache (exact-URL match), so this goes to the server,
+      // which re-verifies the playlist and, if the cached stream signature is
+      // dead, refetches the page for a live one.
+      try {
+        const slug = data.slug || location.pathname.split("/").filter(Boolean).pop() || "";
+        const fresh = await api("/api/watch/" + encodeURIComponent(slug) + "?fresh=1", signal);
+        if (fresh && fresh.stream && fresh.stream.url !== data.stream.url) {
+          await playStream($("player"), fresh.stream.url, signal);
+          msg.classList.add("hidden");
+          return;
+        }
+      } catch (e2) { /* fall through to the error message */ }
       if (signal.aborted) return;
       msg.classList.remove("hidden");
       msgText.textContent = "Could not start this stream.";
@@ -528,63 +523,27 @@
     }
   }
 
-  function proxied(url) {
-    return "/api/stream?url=" + encodeURIComponent(url);
-  }
-
-  /* ---------------------------- direct playback ----------------------------
-   * The playlists and segments live on *.xhmediacdn.com, which is a *different*
-   * host from the one the ISP poisons, and it answers every request with
-   * `Access-Control-Allow-Origin: *`. So the browser can pull the video itself —
-   * exactly the requests a normal viewer on the source site makes.
-   *
-   * That keeps the bytes on the viewer's own connection instead of funnelling
-   * every user's 30–40 minute watch through this one server, and the CDN sees an
-   * ordinary viewer address rather than a single machine moving gigabytes 24/7.
-   * /api/stream stays as the fallback for connections where that host is blocked
-   * or the signed URL refuses a different address.
+  /* ------------------------------ playback ------------------------------
+   * `url` is always a same-origin /api/stream handle minted by the server. The
+   * player never sees the real CDN URL: a direct request would reveal the
+   * visitor's IP to xHamster's edge and let it be throttled or blocked per
+   * address, and it would make every viewer traceable back to this site.
    */
-  const directBlocked = new Set();   // hosts that already failed here, this session
-
-  function hostOf(url) {
-    try { return new URL(url).host; } catch (e) { return ""; }
-  }
-
-  function sourceOrder(url) {
-    const host = hostOf(url);
-    // Once a host has failed in this tab, stop paying the failed attempt per video.
-    if (host && directBlocked.has(host)) return [proxied(url)];
-    return host ? [url, proxied(url)] : [proxied(url)];
-  }
-
-  function noteSourceFail(src) {
-    const host = hostOf(src);
-    if (host) directBlocked.add(host);
-  }
-
   async function playStream(video, url, signal) {
     destroyHls();
-    const sources = sourceOrder(url);
-    let lastErr = null;
-
-    for (let i = 0; i < sources.length; i++) {
-      const src = sources[i];
-      if (signal && signal.aborted) return;
-      try {
-        if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          await attachNative(video, src, signal);
-        } else {
-          await attachHls(video, src, signal);
-        }
-        return;
-      } catch (e) {
-        lastErr = e;
-        destroyHls();
-        noteSourceFail(src);
-        try { video.removeAttribute("src"); video.load(); } catch (err) { /* ignore */ }
+    if (signal && signal.aborted) return;
+    if (!url) throw new Error("stream unavailable");
+    try {
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        await attachNative(video, url, signal);
+      } else {
+        await attachHls(video, url, signal);
       }
+    } catch (e) {
+      destroyHls();
+      try { video.removeAttribute("src"); video.load(); } catch (err) { /* ignore */ }
+      throw e;
     }
-    throw lastErr || new Error("stream unavailable");
   }
 
   // Native HLS (Safari/iOS) needs no library at all.

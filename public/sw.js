@@ -1,10 +1,16 @@
 /*
- * TubeStream service worker — v10
- * Only static assets and thumbnails are cached. Every API call and every
- * navigation goes to the network so the view you open is always the live one.
+ * TubeStream service worker — v13
+ * Static assets and thumbnails are cache-first; listings/watch pages use
+ * stale-while-revalidate in the browser itself. That last part is free capacity:
+ * a repeat visit renders from the Cache API without touching our server at all,
+ * so the same backend serves far more people (and upstream sees no extra load).
+ * Navigations and streams stay network-only.
  */
-const STATIC_CACHE = "ts-static-v10";
-const THUMB_CACHE = "ts-thumbs-v10";
+const STATIC_CACHE = "ts-static-v13";
+const THUMB_CACHE = "ts-thumbs-v13";
+const API_CACHE = "ts-api-v13";
+// Same-origin API routes whose answers are safely revalidated in the background.
+const API_SWR = [/^\/api\/feed$/, /^\/api\/category\//, /^\/api\/search\//, /^\/api\/watch\//];
 const THUMB_TTL = 24 * 3600 * 1000;
 
 const STATIC_ASSETS = ["/style.css", "/app.js", "/vendor/hls.min.js"];
@@ -21,7 +27,8 @@ self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys()
       .then((keys) => Promise.all(
-        keys.filter((k) => k !== STATIC_CACHE && k !== THUMB_CACHE).map((k) => caches.delete(k))
+        keys.filter((k) => k !== STATIC_CACHE && k !== THUMB_CACHE && k !== API_CACHE)
+          .map((k) => caches.delete(k))
       ))
       .then(() => self.clients.claim())
   );
@@ -41,6 +48,7 @@ self.addEventListener("fetch", (e) => {
   // Everything under /api: network only.
   if (url.pathname.startsWith("/api/")) {
     if (url.pathname === "/api/thumb") e.respondWith(thumbCacheFirst(req));
+    else if (API_SWR.some((re) => re.test(url.pathname))) e.respondWith(apiStaleWhileRevalidate(req));
     return;
   }
 
@@ -74,6 +82,21 @@ async function thumbCacheFirst(req) {
   } catch (err) {
     return (await cache.match(req)) || new Response("", { status: 504, statusText: "Offline" });
   }
+}
+
+/* Browser-side stale-while-revalidate for JSON views: instant paint from the
+ * Cache API, one background revalidation. Two visitors on the same page now cost
+ * the network once per browser, not once per visit. */
+async function apiStaleWhileRevalidate(req) {
+  const cache = await caches.open(API_CACHE);
+  const hit = await cache.match(req);
+  const network = fetch(req)
+    .then((res) => {
+      if (res.ok) cache.put(req, res.clone());
+      return res;
+    })
+    .catch(() => hit || Response.error());
+  return hit || network;
 }
 
 async function staleWhileRevalidate(req) {

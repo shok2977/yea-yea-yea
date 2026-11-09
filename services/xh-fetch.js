@@ -29,10 +29,24 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const fs = require("fs");
 const path = require("path");
+const egress = require("./egress");
+const shared = require("./shared");
 
 const XH_HOST = "xhamster.com";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+/* Chrome on Windows only, with just the major version varying. Mixing an Edge UA
+ * with `sec-ch-ua: "Google Chrome"`, or a macOS platform string with a Windows
+ * UA, is a one-request bot tell — the header set has to agree with itself, and
+ * an inconsistent set is exactly what a WAF scores highest. */
+const UA_VARIANTS = ["124", "125", "126", "127", "128"].map(
+  (v) => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + v + ".0.0.0 Safari/537.36"
+);
+
+function getRandomUA() {
+  return UA_VARIANTS[Math.floor(Math.random() * UA_VARIANTS.length)];
+}
 
 /* xHamster's own domain fleet. Ordered: canonical first, then the mirrors their
  * own users get redirected to when a region blocks the main domain. */
@@ -60,6 +74,8 @@ if (!HOST_POOL.length) {
 const DOH_ENDPOINTS = [
   "https://1.1.1.1/dns-query?name=<host>&type=A",   // Cloudflare dns-json
   "https://8.8.8.8/resolve?name=<host>&type=A",     // Google DNS JSON fallback
+  "https://dns.quad9.net/dns-query?name=<host>&type=A", // Quad9 DNS JSON
+  "https://dns.opendns.com/dns-query?name=<host>&type=A",   // OpenDNS DNS JSON
 ];
 const DNS_TTL = 5 * 60 * 1000;
 
@@ -102,8 +118,18 @@ async function resolveHost(host, force) {
         const prev = dnsState.get(host);
         dnsState.set(host, { ips, ts: Date.now(), idx: (prev ? prev.idx + (force ? 1 : 0) : 0) });
         console.log("[xhFetch] DoH", host, "->", ips.join(", "));
+        persistHealth();   // remember the last real edge IPs for the next boot
         return ips;
       } catch (e) { lastErr = e; }
+    }
+    // Every DoH resolver unreachable (a network that blocks 1.1.1.1/8.8.8.8 is
+    // normal on the same ISPs that hijack this domain). Fall back to the last
+    // known-good edge IPs instead of the system resolver, which is precisely the
+    // one that returns the block page.
+    const pin = dnsState.get(host);
+    if (pin && pin.ips && pin.ips.length) {
+      console.warn("[xhFetch] DoH unavailable for", host, "— reusing last known-good edge IPs");
+      return pin.ips;
     }
     throw lastErr || new Error("doh failed for " + host);
   })().finally(() => resolving.delete(host));
@@ -277,27 +303,44 @@ function persistHealth() {
   if (persistTimer) return;
   persistTimer = setTimeout(() => {
     persistTimer = null;
+    const hosts = {};
+    const now = Date.now();
+    for (const [host, h] of health) {
+      if ((h.cooldownUntil || 0) > now) {
+        hosts[host] = { cooldownUntil: h.cooldownUntil, fails: h.fails || 1, lastErr: h.lastErr || "" };
+      }
+    }
+    const dnsPins = {};
+    for (const [host, st] of dnsState) {
+      if (st && Array.isArray(st.ips) && st.ips.length) dnsPins[host] = { ips: st.ips, ts: st.ts || 0 };
+    }
+    const breakerUntil = shared.breakerStatus().until;
+    const payload = { hosts, dnsPins, globalPauseUntil: Math.max(globalPauseUntil, breakerUntil), savedAt: now };
+    // Cluster: replicas share cooldowns so one replica's block cools the host
+    // for everyone instead of each replica re-learning it the hard way.
+    shared.healthSet(payload);
     try {
       fs.mkdirSync(STATE_DIR, { recursive: true });
-      const hosts = {};
-      const now = Date.now();
-      for (const [host, h] of health) {
-        if ((h.cooldownUntil || 0) > now) {
-          hosts[host] = { cooldownUntil: h.cooldownUntil, fails: h.fails || 1, lastErr: h.lastErr || "" };
-        }
-      }
       const tmp = STATE_FILE + ".tmp";
-      fs.writeFileSync(tmp, JSON.stringify({ hosts, globalPauseUntil, savedAt: now }));
+      fs.writeFileSync(tmp, JSON.stringify(payload));
       fs.renameSync(tmp, STATE_FILE);
     } catch (e) { /* best effort — never block a fetch on disk */ }
   }, 500);
   if (persistTimer.unref) persistTimer.unref();
 }
 
-function hydrateHealth() {
+async function hydrateHealth() {
+  let raw = null;
   try {
-    if (!fs.existsSync(STATE_FILE)) return;
-    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    raw = await shared.healthGet();   // cluster state wins when present
+  } catch (e) { raw = null; }
+  if (!raw) {
+    try {
+      if (fs.existsSync(STATE_FILE)) raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    } catch (e) { raw = null; }
+  }
+  if (!raw) return;
+  try {
     const now = Date.now();
     let restored = 0;
     for (const host of Object.keys((raw && raw.hosts) || {})) {
@@ -306,6 +349,13 @@ function hydrateHealth() {
       if ((h.cooldownUntil || 0) <= now) continue;
       health.set(host, { fails: h.fails || 1, cooldownUntil: h.cooldownUntil, lastErr: h.lastErr || "restored" });
       restored++;
+    }
+    for (const host of Object.keys((raw && raw.dnsPins) || {})) {
+      const pin = raw.dnsPins[host];
+      if (!isPoolHost(host) || !pin || !Array.isArray(pin.ips) || !pin.ips.length) continue;
+      if (dnsState.has(host)) continue;
+      const ips = pin.ips.filter((ip) => typeof ip === "string" && /^[0-9a-fA-F:.]+$/.test(ip));
+      if (ips.length) dnsState.set(host, { ips, ts: 0, idx: 0 });   // ts 0 = stale, DoH still preferred
     }
     if (raw && raw.globalPauseUntil > now) globalPauseUntil = raw.globalPauseUntil;
     if (restored) console.log("[xhFetch] restored " + restored + " host cooldown(s) from last run");
@@ -324,12 +374,21 @@ const GLOBAL_STRIKES = 3;
 const GLOBAL_PAUSE_MS = 120 * 1000;
 
 function noteRefusal() {
+  // A refusal is the signal that the upstream limit is lower than we thought:
+  // the adaptive budget shrinks toward its base (cluster-wide).
+  shared.budgetRefusal();
   if (Date.now() < globalPauseUntil) return;
   strikes += 1;
   if (strikes < GLOBAL_STRIKES) return;
   strikes = 0;
-  globalPauseUntil = Date.now() + GLOBAL_PAUSE_MS;
-  console.warn("[xhFetch] refused " + GLOBAL_STRIKES + "x — pausing all upstream fetches for " + Math.round(GLOBAL_PAUSE_MS / 1000) + "s");
+  // Fleet-wide, not just this process: one replica noticing the block is enough
+  // to make every replica stop asking, so N replicas cost 3 refusals, not 3N.
+  const trip = shared.breakerTrip("upstream refused");
+  globalPauseUntil = Math.max(globalPauseUntil, trip.until);
+  console.warn(
+    "[xhFetch] refused " + GLOBAL_STRIKES + "x — pausing upstream for " +
+    Math.round((trip.until - Date.now()) / 1000) + "s (fleet-wide, level " + trip.level + ")"
+  );
   persistHealth();
 }
 
@@ -349,6 +408,12 @@ function cooldownFor(host, err) {
 }
 
 function markOk(host) {
+  shared.budgetSuccess();   // success grows the adaptive upstream budget
+  // They answered us: close the breaker everywhere so the fleet resumes.
+  if (globalPauseUntil || shared.breakerStatus().active) {
+    globalPauseUntil = 0;
+    shared.breakerReset();
+  }
   const h = health.get(host) || { fails: 0 };
   const wasCooling = (h.cooldownUntil || 0) > 0;
   h.fails = 0;
@@ -385,6 +450,29 @@ function candidates() {
   return order.length ? order : HOST_POOL.slice();
 }
 
+/* Attempt one host, preferring a rotating egress proxy when configured.
+ * A proxy that fails at the transport level is retired and the *same host* is
+ * retried directly: the mirror may be perfectly healthy, and cooling it down
+ * would poison the only address that still works. An HTTP status from upstream
+ * is a real answer, so it propagates and the caller rotates as before. */
+async function attemptWithEgress(host, pathAndQuery, headers, timeoutMs, redirects) {
+  const pick = egress.enabled("page") ? egress.agentFor("page") : null;
+  if (!pick) {
+    return { got: await attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects, null), pick: null };
+  }
+  try {
+    const got = await attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects, pick.agent);
+    egress.report(pick.entry, true);
+    return { got, pick };
+  } catch (e) {
+    const sc = e && e.status;
+    egress.report(pick.entry, false, sc ? "http " + sc : ((e && e.message) || "error"));
+    if (sc) throw e;
+    const got = await attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects, null);
+    return { got, pick: null };
+  }
+}
+
 /* ---------- Global soft pacing for background hits ---------- */
 const BG_GAP_MS = 1200;           // ≥1 background hit / 1.2 s — burst-safe
 let bgChain = Promise.resolve();
@@ -410,7 +498,7 @@ function parseRetryAfter(v) {
   return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
 }
 
-function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects) {
+function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects, agent) {
   const target = "https://" + host + pathAndQuery;
   const left = redirects == null ? 3 : redirects;
 
@@ -420,7 +508,7 @@ function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects) {
     : headers;
 
   return new Promise((resolve, reject) => {
-    const req = https.request(target, { agent: xhAgent, method: "GET", headers: sendHeaders, timeout: timeoutMs }, (res) => {
+    const req = https.request(target, { agent: agent || xhAgent, method: "GET", headers: sendHeaders, timeout: timeoutMs }, (res) => {
       const sc = res.statusCode || 0;
       if (res.headers["set-cookie"]) storeCookies(res.headers["set-cookie"]);
 
@@ -434,7 +522,23 @@ function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects) {
           err.status = 403;
           return reject(err);
         }
-        return resolve(attemptOnce(nextHost, nextHref.pathname + nextHref.search, headers, timeoutMs, left - 1));
+        return resolve(attemptOnce(nextHost, nextHref.pathname + nextHref.search, headers, timeoutMs, left - 1, agent));
+      }
+      // 304 Not Modified (RFC 9110 §15.4.5): we asked "has this changed?" and
+      // the answer is "no". No body arrives, nothing needs parsing — the
+      // cheapest possible upstream exchange, and the one every real browser and
+      // CDN makes. This is why conditional requests are the backbone of polite
+      // crawling: re-validation costs a few hundred bytes.
+      if (sc === 304) {
+        res.resume();
+        return resolve({
+          body: "",
+          host,
+          notModified: true,
+          etag: String(res.headers.etag || ""),
+          lastModified: String(res.headers["last-modified"] || ""),
+          cacheControl: String(res.headers["cache-control"] || ""),
+        });
       }
       if (sc !== 200) {
         res.resume();
@@ -455,6 +559,10 @@ function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects) {
       res.on("end", () => resolve({
         body: decodeBody(Buffer.concat(chunks), res.headers["content-encoding"]),
         host,
+        notModified: false,
+        etag: String(res.headers.etag || ""),
+        lastModified: String(res.headers["last-modified"] || ""),
+        cacheControl: String(res.headers["cache-control"] || ""),
       }));
       res.on("error", reject);
     });
@@ -469,10 +577,15 @@ function attemptOnce(host, pathAndQuery, headers, timeoutMs, redirects) {
  *
  * @param {string} url   any URL whose hostname belongs to the fleet; the host is
  *                       replaced with whichever mirror is currently healthy.
- * @param {object} opts  { timeoutMs, budgetMs, priority, headers, validate }
+ * @param {object} opts  { timeoutMs, budgetMs, priority, headers, validate,
+ *                         validators, meta }
  *                       validate(body) -> bool; a mirror that answers 200 but
  *                       ships a block page is treated as down.
- * @returns {Promise<string>} the body
+ *                       validators { etag, lastModified } turns the request into
+ *                       a conditional GET, so an unchanged page comes back 304.
+ *                       meta: true resolves { notModified, body, etag,
+ *                       lastModified } instead of a bare string.
+ * @returns {Promise<string|object>} the body, or the meta object
  */
 async function xhFetchText(url, opts) {
   const o = opts || {};
@@ -482,30 +595,44 @@ async function xhFetchText(url, opts) {
   const validate = typeof o.validate === "function" ? o.validate : null;
   // Header set mirrors Chrome 125 on Windows. A bare `User-Agent` with two
   // headers is the cheapest bot tell there is; these are the headers a real
-  // navigation actually carries.
+  // navigation actually carries. We add slight variance so every request
+  // doesn't have identical fingerprints.
+  const ua = getRandomUA();
+  const uaMajor = ua.match(/Chrome\/(\d+)/)?.[1] || "125";
+  const secUa = `"Chromium";v="${uaMajor}", "Not.A/Brand";v="24", "Google Chrome";v="${uaMajor}"`;
   const headers = Object.assign({
-    "User-Agent": UA,
+    "User-Agent": ua,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": ["en-US,en;q=0.9", "en-GB,en;q=0.9", "en-US,en;q=0.8"][Math.floor(Math.random() * 3)],
     "Accept-Encoding": "gzip, deflate, br",
-    "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24", "Google Chrome";v="125"',
+    "sec-ch-ua": secUa,
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua-platform": '"Windows"',   // must agree with the UA above
     "sec-fetch-dest": "document",
     "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
+    "sec-fetch-site": ["none", "same-origin"][Math.floor(Math.random() * 2)],
     "sec-fetch-user": "?1",
     "upgrade-insecure-requests": "1",
     Connection: "keep-alive",
   }, o.headers || {});
 
+  // Conditional request headers. If-None-Match wins over If-Modified-Since
+  // because an ETag is content-exact and a date is only second-granular.
+  const validators = o.validators || null;
+  if (validators) {
+    if (validators.etag) headers["If-None-Match"] = validators.etag;
+    else if (validators.lastModified) headers["If-Modified-Since"] = validators.lastModified;
+  }
+  const meta = !!o.meta;
+
   let base;
   try { base = new URL(url); } catch (e) { throw new Error("bad upstream url"); }
   const pathAndQuery = base.pathname + base.search;
 
-  // Circuit breaker tripped: serve from cache and stay silent. Asking again 200
-  // ms later is exactly what an impatient scraper does.
-  if (Date.now() < globalPauseUntil) {
+  // Circuit breaker tripped (locally or by another replica): serve from cache
+  // and stay silent. Asking again 200 ms later is what an impatient scraper
+  // does — and what turns a rate limit into a ban.
+  if (Date.now() < globalPauseUntil || (await shared.breakerActive())) {
     const err = new Error("upstream cooling down — serving cache only");
     err.status = 503;
     err.globalPause = true;
@@ -536,14 +663,36 @@ async function xhFetchText(url, opts) {
     }
 
     try {
-      const got = await attemptOnce(host, pathAndQuery, headers, timeoutMs, 3);
+      const attempt = await attemptWithEgress(host, pathAndQuery, headers, timeoutMs, 3);
+      const got = attempt.got;
+      if (got.notModified) {
+        markOk(got.host);
+        return meta
+          ? {
+              notModified: true,
+              body: "",
+              etag: got.etag || (validators && validators.etag) || "",
+              lastModified: got.lastModified || (validators && validators.lastModified) || "",
+              cacheControl: got.cacheControl || "",
+            }
+          : "";
+      }
       if (validate && !validate(got.body)) {
+        egress.report(attempt.pick && attempt.pick.entry, false, "invalid payload");
         markBad(got.host, 60000, "invalid payload");
         lastErr = new Error("invalid payload from " + got.host);
         continue;
       }
       markOk(got.host);
-      return got.body;
+      return meta
+        ? {
+            notModified: false,
+            body: got.body,
+            etag: got.etag || "",
+            lastModified: got.lastModified || "",
+            cacheControl: got.cacheControl || "",
+          }
+        : got.body;
     } catch (e) {
       lastErr = e;
       const sc = e && e.status;
@@ -570,10 +719,27 @@ async function xhFetchText(url, opts) {
 const SUGGEST_URL = "https://" + XH_HOST + "/api/front/search/suggest?searchValue=<q>&searchScope=common&orientation=0";
 let suggestCsrf = crypto.randomBytes(16).toString("hex");
 
+/* Typing is the highest-frequency upstream call in the whole app, and it used to
+ * bypass background pacing entirely. One upstream suggest per 600ms, no matter
+ * how many people are typing; the local cache absorbs almost every keystroke. */
+const SUGGEST_GAP_MS = 600;
+let suggestChain = Promise.resolve();
+let lastSuggestAt = 0;
+
+function paceSuggest() {
+  suggestChain = suggestChain.then(async () => {
+    const wait = Math.max(0, lastSuggestAt + SUGGEST_GAP_MS - Date.now());
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastSuggestAt = Date.now();
+  }).catch(() => {});
+  return suggestChain;
+}
+
 async function xhSuggest(q) {
   const clean = String(q || "").trim().slice(0, 50);
   if (clean.length < 2) return [];
   const url = SUGGEST_URL.replace("<q>", encodeURIComponent(clean));
+  await paceSuggest();
   const body = await xhFetchText(url, {
     timeoutMs: 5000,
     priority: 0,                                  // user is typing — serve instantly
@@ -620,11 +786,12 @@ function poolStatus() {
 const resolveIps = (force) => resolveHost(XH_HOST, force);
 const prewarmIps = () => resolveHost(XH_HOST, false).catch(() => {});
 
-hydrateHealth();
+hydrateHealth();   // fire-and-forget for local mode; server re-runs after shared.init()
 
 module.exports = {
   xhFetchText,
   xhSuggest,
+  hydrateHealth,
   prewarmIps,
   resolveIps,
   poolStatus,
@@ -635,6 +802,7 @@ module.exports = {
     tokens: Math.round(tokens * 10) / 10,
     quietForMs: Math.max(0, globalPauseUntil - Date.now()),
     strikes,
+    breaker: shared.breakerStatus(),
   }),
   HOST_POOL,
   UA,
